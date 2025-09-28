@@ -41,7 +41,12 @@ android {
 }
 
 dependencies {
+    implementation(libs.androidx.fragment)
+    implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.room.ktx)
+    implementation(libs.androidx.compose.foundation.layout)
+    implementation(libs.androidx.adapters)
+    implementation(libs.androidx.compose.ui.geometry)
     kapt("androidx.room:room-compiler:2.8.0")
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.core.ktx)
