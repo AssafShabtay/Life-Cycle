@@ -82,7 +82,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -92,24 +91,18 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.myapplication.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 class DatabaseViewerActivity : ComponentActivity() {
     private lateinit var database: ActivityDatabase
@@ -252,6 +245,35 @@ fun DailyActivityPieChartWithNavigation(
                 .padding(20.dp),
             contentAlignment = Alignment.Center
         ) {
+            // Time labels around the clock
+            Text(
+                text = "00:00",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.TopCenter)
+                    .offset(y = (-15).dp)
+            )
+            Text(
+                text = "06:00",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.CenterEnd)
+                    .offset(x = 15.dp)
+            )
+            Text(
+                text = "12:00",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.BottomCenter)
+                    .offset(y = 15.dp)
+            )
+            Text(
+                text = "18:00",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.CenterStart)
+                    .offset(x = (-15).dp)
+            )
 
             // The actual pie chart with click handler
             AnimatedPieChart(
@@ -296,186 +318,373 @@ fun AnimatedPieChart(
     onSegmentClick: (ActivityTimeSlot) -> Unit = {}
 ) {
     var animationProgress by remember { mutableStateOf(0f) }
-    var measuredSize by remember { mutableStateOf<IntSize>(IntSize(0, 0)) }
 
+    val textPaint = remember {
+        android.graphics.Paint().apply {
+            textSize = 18f
+            color = android.graphics.Color.WHITE
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            isAntiAlias = true
+        }
+    }
 
-    // for hit detection
-    val computedSegments = remember { mutableStateListOf<Triple<ActivityTimeSlot, Float, Float>>() }
-    // for icon overlay
-    val iconPositions = remember { mutableStateListOf<Triple<ActivityTimeSlot, Float, Offset>>() }
+    // Store segment bounds for interaction
+    data class SegmentBounds(
+        val slot: ActivityTimeSlot,
+        val startAngle: Float,
+        val sweepAngle: Float
+    )
 
-    // animate
+    val segmentBounds = remember { mutableStateListOf<SegmentBounds>() }
+
     LaunchedEffect(data) {
         animationProgress = 0f
         animate(
             initialValue = 0f,
             targetValue = 1f,
-            animationSpec = tween(650, easing = FastOutSlowInEasing)
-        ) { value, _ -> animationProgress = value }
+            animationSpec = tween(durationMillis = 800, easing = FastOutSlowInEasing)
+        ) { value, _ ->
+            animationProgress = value
+        }
     }
 
-    Box(
-        modifier = modifier.onSizeChanged { measuredSize = it }
-    ) {
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(data) {
-                    detectTapGestures { offset ->
-                        if (computedSegments.isEmpty()) return@detectTapGestures
-                        val cx = measuredSize.width / 2f
-                        val cy = measuredSize.height / 2f
-                        val dx = offset.x - cx
-                        val dy = offset.y - cy
-                        val distance = sqrt(dx * dx + dy * dy)
+    Canvas(
+        modifier = modifier.pointerInput(data) {
+            detectTapGestures { offset ->
+                val centerX = size.width / 2f
+                val centerY = size.height / 2f
+                val distance = kotlin.math.sqrt(
+                    (offset.x - centerX) * (offset.x - centerX) +
+                            (offset.y - centerY) * (offset.y - centerY)
+                )
 
-                        val canvasMin = min(measuredSize.width, measuredSize.height).toFloat()
-                        val outerRadius = canvasMin / 2f * 0.85f
-                        val innerRadius = outerRadius * 0.55f
-                        if (distance < innerRadius || distance > outerRadius) return@detectTapGestures
+                val radius = min(size.width, size.height) / 2f * 0.85f
+                val innerRadius = radius * 0.55f
 
-                        var clickAngle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
-                        if (clickAngle < 0) clickAngle += 360f
-                        clickAngle = (clickAngle + 90f) % 360f
+                if (distance in innerRadius..radius) {
+                    var clickAngle = kotlin.math.atan2(
+                        offset.y - centerY,
+                        offset.x - centerX
+                    ) * 180 / kotlin.math.PI - 90
 
-                        computedSegments.forEach { (slot, startA, sweepA) ->
-                            val endA = (startA + sweepA) % 360f
-                            val contains = if (startA <= endA) {
-                                clickAngle in startA..endA
-                            } else {
-                                clickAngle >= startA || clickAngle <= endA
-                            }
-                            if (contains) {
-                                onSegmentClick(slot)
-                                return@detectTapGestures
-                            }
+                    if (clickAngle < 0) clickAngle += 360
+
+                    segmentBounds.forEach { bounds ->
+                        val endAngle = bounds.startAngle + bounds.sweepAngle
+                        val inSegment = if (bounds.startAngle <= endAngle) {
+                            clickAngle >= bounds.startAngle && clickAngle <= endAngle
+                        } else {
+                            clickAngle >= bounds.startAngle || clickAngle <= endAngle
+                        }
+
+                        if (inSegment) {
+                            onSegmentClick(bounds.slot)
+                            return@detectTapGestures
                         }
                     }
                 }
-        ) {
-            val canvasMin = min(size.width, size.height)
-            val outerRadius = canvasMin / 2f * 0.85f
-            val innerRadius = outerRadius * 0.55f
-            val center = Offset(size.width / 2f, size.height / 2f)
-
-            computedSegments.clear()
-            iconPositions.clear()
-
-            // background circle
-            drawCircle(Color(0xFFF5F5F5), radius = outerRadius * 1.05f, center = center)
-
-            if (data.isEmpty()) {
-                drawCircle(Color.White, radius = innerRadius * 0.9f, center = center)
-                val paint = android.graphics.Paint().apply {
-                    textSize = 36f; color = android.graphics.Color.BLACK
-                    textAlign = android.graphics.Paint.Align.CENTER; isAntiAlias = true
-                }
-                drawContext.canvas.nativeCanvas.drawText("No data", center.x, center.y, paint)
-                return@Canvas
             }
+        }
+    ) {
+        val canvasSize = size.minDimension
+        val radius = canvasSize / 2f * 0.85f
+        val innerRadius = radius * 0.55f
+        val center = Offset(size.width / 2f, size.height / 2f)
 
-            // compute angles with minimum slice size
-            val minSweepAngle = 6f
-            val totalMinutes = data.sumOf { it.durationMillis } / (1000 * 60).toFloat().coerceAtLeast(1f)
-            val rawAngles = data.map {
-                val minutes = (it.durationMillis / (1000 * 60)).toFloat()
-                (minutes / totalMinutes) * 360f
-            }.toMutableList()
-            val assignedAngles = MutableList(rawAngles.size) { 0f }
-            var remaining = 360f; var adjustableSum = 0f
-            for (i in rawAngles.indices) {
-                if (rawAngles[i] < minSweepAngle) {
-                    assignedAngles[i] = minSweepAngle; remaining -= minSweepAngle
-                } else adjustableSum += rawAngles[i]
-            }
-            if (remaining <= 0f || adjustableSum <= 0f) {
-                val equal = 360f / rawAngles.size
-                for (i in assignedAngles.indices) assignedAngles[i] = equal
-            } else {
-                val scale = remaining / adjustableSum
-                for (i in rawAngles.indices) if (assignedAngles[i] == 0f) assignedAngles[i] = rawAngles[i] * scale
-            }
+        // Clear bounds
+        segmentBounds.clear()
 
-            var currentStart = -90f
-            for (i in data.indices) {
-                val slot = data[i]
-                val sweep = assignedAngles[i]
-                val animatedSweep = sweep * animationProgress
-                val drawSweep = if (animatedSweep > 1f) animatedSweep - 1f else animatedSweep
+        // Background
+        drawCircle(
+            color = Color(0xFFF5F5F5),
+            radius = radius * 1.05f,
+            center = center
+        )
 
-                // donut path
-                val path = Path().apply {
-                    arcTo(Rect(center - Offset(outerRadius, outerRadius), Size(outerRadius*2, outerRadius*2)),
-                        currentStart, drawSweep, true)
-                    arcTo(Rect(center - Offset(innerRadius, innerRadius), Size(innerRadius*2, innerRadius*2)),
-                        currentStart + drawSweep, -drawSweep, false)
-                    close()
-                }
-                drawPath(path, slot.color)
+        // Calculate total time
+        val totalMinutes = data.sumOf { it.durationMillis } / (1000 * 60)
+        val totalHours = totalMinutes / 60
+        val remainingMinutes = totalMinutes % 60
 
-                // store for tap detection
-                val storedStart = (currentStart + 90f + 360f) % 360f
-                computedSegments.add(Triple(slot, storedStart, sweep))
+        // Draw segments - SIMPLIFIED APPROACH
+        val strokeWidth = radius - innerRadius
+        val middleRadius = (radius + innerRadius) / 2f
+        val minDisplayAngle = 8f // Minimum angle for text display
 
-                // compute icon+text position
-                val midAngle = currentStart + sweep/2f
-                val rad = Math.toRadians(midAngle.toDouble())
-                val radius = innerRadius + (outerRadius - innerRadius) * 0.65f
-                val pos = Offset(center.x + (radius * cos(rad)).toFloat(),
-                    center.y + (radius * sin(rad)).toFloat())
+        // Process segments with minimum visual size
+        data class VisualSegment(
+            val slot: ActivityTimeSlot,
+            val startAngle: Float,
+            val sweepAngle: Float,
+            val displayAngle: Float
+        )
 
-                // record icon positions for overlay
-                iconPositions.add(Triple(slot, sweep, pos))
+        val visualSegments = mutableListOf<VisualSegment>()
+        var accumulatedAngle = 0f
 
-                // duration text
-                val minutes = (slot.durationMillis / (1000*60)).toLong()
-                val durationText = when {
-                    minutes >= 60 -> {
-                        val h = minutes/60; val m = minutes%60
-                        if (m > 0) "${h}h ${m}m" else "${h}h"
-                    }
-                    minutes > 0 -> "${minutes}m"
-                    else -> "<1m"
-                }
-                val paint = android.graphics.Paint().apply {
-                    textSize = 24f; color = android.graphics.Color.WHITE
-                    textAlign = android.graphics.Paint.Align.CENTER; isAntiAlias = true
-                }
-                if (animatedSweep > 2f) {
-                    drawContext.canvas.nativeCanvas.drawText(durationText, pos.x, pos.y+32f, paint)
+        data.forEach { slot ->
+            val calendar = Calendar.getInstance()
+            calendar.time = slot.startTime
+            val startHour = calendar.get(Calendar.HOUR_OF_DAY)
+            val startMinute = calendar.get(Calendar.MINUTE)
+            val startMinutes = startHour * 60 + startMinute
+
+            calendar.time = slot.endTime
+            val endHour = calendar.get(Calendar.HOUR_OF_DAY)
+            val endMinute = calendar.get(Calendar.MINUTE)
+            var endMinutes = endHour * 60 + endMinute
+            if (endMinutes < startMinutes) endMinutes += 24 * 60
+
+            val sweepAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
+            val startAngle = (startMinutes / (24f * 60f)) * 360f - 90f
+
+            // Only include if sweep angle is meaningful
+            if (sweepAngle > 0.5f) {
+                val displayAngle = if (slot.durationMillis >= 15 * 60 * 1000 && sweepAngle < minDisplayAngle) {
+                    minDisplayAngle
+                } else {
+                    sweepAngle
                 }
 
-                currentStart += sweep
+                visualSegments.add(
+                    VisualSegment(
+                        slot = slot,
+                        startAngle = startAngle,
+                        sweepAngle = sweepAngle,
+                        displayAngle = displayAngle
+                    )
+                )
+                accumulatedAngle += displayAngle
             }
-
-            // center white hole
-            drawCircle(Color.White, radius = innerRadius*0.9f, center = center)
-
-            // center text: replace with your steps variable instead of "10070"
-            val centerTextPaint = android.graphics.Paint().apply {
-                textSize = 42f; color = android.graphics.Color.BLACK
-                textAlign = android.graphics.Paint.Align.CENTER; isAntiAlias = true
-            }
-            val subPaint = android.graphics.Paint().apply {
-                textSize = 22f; color = android.graphics.Color.GRAY
-                textAlign = android.graphics.Paint.Align.CENTER; isAntiAlias = true
-            }
-            drawContext.canvas.nativeCanvas.drawText("10070", center.x, center.y-6, centerTextPaint)
-            drawContext.canvas.nativeCanvas.drawText("steps", center.x, center.y+30, subPaint)
         }
 
-        // === Overlay icons as Composables ===
-        iconPositions.forEach { (slot, _, pos) ->
-            Icon(
-                imageVector = getIconForActivity(slot.activityType),
-                contentDescription = slot.activityType,
-                modifier = Modifier
-                    .offset { IntOffset((pos.x - 14).roundToInt(), (pos.y - 14).roundToInt()) }
-                    .size(28.dp),
-                tint = Color.White
+        // Scale display angles if needed
+        if (accumulatedAngle > 360f && visualSegments.isNotEmpty()) {
+            val scale = 360f / accumulatedAngle
+            visualSegments.replaceAll { it.copy(displayAngle = it.displayAngle * scale) }
+        }
+
+        // Draw each segment
+        var currentAngle = -90f
+        visualSegments.forEach { segment ->
+            val animatedSweep = segment.displayAngle * animationProgress
+
+            if (animatedSweep > 0.5f) {
+                // Add small gap
+                val gapSize = if (animatedSweep > 2f) 0.5f else 0f
+
+                // Draw using simple arc
+                drawArc(
+                    color = segment.slot.color,
+                    startAngle = currentAngle + gapSize,
+                    sweepAngle = animatedSweep - (gapSize * 2),
+                    useCenter = false,
+                    topLeft = center - Offset(middleRadius, middleRadius),
+                    size = Size(middleRadius * 2, middleRadius * 2),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = strokeWidth,
+                        cap = androidx.compose.ui.graphics.StrokeCap.Butt
+                    )
+                )
+
+                // Store bounds for click detection
+                segmentBounds.add(
+                    SegmentBounds(
+                        slot = segment.slot,
+                        startAngle = if (currentAngle < 0) currentAngle + 360 else currentAngle,
+                        sweepAngle = segment.displayAngle
+                    )
+                )
+
+                // Draw text for 15+ minute segments
+                if (segment.slot.durationMillis >= 15 * 60 * 1000 &&
+                    animationProgress > 0.8f &&
+                    segment.displayAngle >= 6f) {
+
+                    val midAngle = currentAngle + (segment.displayAngle / 2f)
+                    val midAngleRad = Math.toRadians(midAngle.toDouble())
+
+                    val textX = center.x + (middleRadius * cos(midAngleRad)).toFloat()
+                    val textY = center.y + (middleRadius * sin(midAngleRad)).toFloat()
+
+                    val durationMinutes = segment.slot.durationMillis / (1000 * 60)
+                    val durationText = when {
+                        durationMinutes >= 60 -> "${durationMinutes / 60}h${if (durationMinutes % 60 > 0) "${durationMinutes % 60}m" else ""}"
+                        else -> "${durationMinutes}m"
+                    }
+
+                    drawContext.canvas.nativeCanvas.drawText(
+                        durationText,
+                        textX,
+                        textY + 6,
+                        textPaint
+                    )
+                }
+
+                currentAngle += segment.displayAngle
+            }
+        }
+
+        // Center circle
+        drawCircle(
+            color = Color.White,
+            radius = innerRadius * 0.9f,
+            center = center
+        )
+
+        // Center text
+        val centerTextPaint = android.graphics.Paint().apply {
+            textSize = 42f
+            color = android.graphics.Color.BLACK
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            isAntiAlias = true
+        }
+
+        drawContext.canvas.nativeCanvas.drawText(
+            if (totalHours > 0 || remainingMinutes > 0) {
+                "${totalHours}h ${remainingMinutes}m"
+            } else {
+                "No data"
+            },
+            center.x,
+            center.y - 5,
+            centerTextPaint
+        )
+
+        drawContext.canvas.nativeCanvas.drawText(
+            "tracked",
+            center.x,
+            center.y + 30,
+            android.graphics.Paint().apply {
+                textSize = 24f
+                color = android.graphics.Color.rgb(100, 100, 100)
+                textAlign = android.graphics.Paint.Align.CENTER
+                isAntiAlias = true
+            }
+        )
+    }
+}
+
+suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<ActivityTimeSlot> {
+    val calendar = Calendar.getInstance()
+    calendar.time = date
+    calendar.set(Calendar.HOUR_OF_DAY, 0)
+    calendar.set(Calendar.MINUTE, 0)
+    calendar.set(Calendar.SECOND, 0)
+    calendar.set(Calendar.MILLISECOND, 0)
+    val startOfDay = calendar.time
+
+    calendar.add(Calendar.DAY_OF_MONTH, 1)
+    val endOfDay = calendar.time
+
+    // Get all activities for the day
+    val stillLocations = dao.getStillLocationsBetween(startOfDay, endOfDay)
+    val movementActivities = dao.getMovementActivitiesBetween(startOfDay, endOfDay)
+
+    val colors = mapOf(
+        "Still" to Color(0xFF9E9E9E),
+        "Walking" to Color(0xFF4CAF50),
+        "Running" to Color(0xFFFF9800),
+        "Driving" to Color(0xFF2196F3),
+        "Cycling" to Color(0xFF9C27B0),
+        "On Foot" to Color(0xFF8BC34A),
+        "Unknown" to Color(0xFF607D8B)
+    )
+
+    val allSlots = mutableListOf<ActivityTimeSlot>()
+
+    // Process still locations
+    stillLocations.forEach { location ->
+        val activityType = location.wasSupposedToBeActivity ?: "Still"
+        val duration = location.duration ?: 0L
+        val endTime = Date(location.timestamp.time + duration)
+
+        allSlots.add(
+            ActivityTimeSlot(
+                activityType = activityType,
+                startTime = location.timestamp,
+                endTime = endTime,
+                durationMillis = duration,
+                color = colors[activityType] ?: colors.getOrDefault(
+                    activityType.substringBefore(" ("),
+                    Color(0xFF795548)
+                )
             )
+        )
+    }
+
+    // Process movement activities
+    movementActivities.forEach { activity ->
+        val activityType = if (activity.actuallyMoved) {
+            activity.activityType
+        } else {
+            "Still (${activity.activityType})"
+        }
+
+        allSlots.add(
+            ActivityTimeSlot(
+                activityType = activityType,
+                startTime = activity.startTime,
+                endTime = activity.endTime,
+                durationMillis = activity.endTime.time - activity.startTime.time,
+                color = colors[activityType] ?: colors.getOrDefault(
+                    activityType.substringBefore(" ("),
+                    Color(0xFF795548)
+                )
+            )
+        )
+    }
+
+    // Sort by start time
+    val sortedSlots = allSlots.sortedBy { it.startTime }
+
+    // CRITICAL: Merge overlapping segments and remove duplicates
+    val mergedSlots = mutableListOf<ActivityTimeSlot>()
+    sortedSlots.forEach { slot ->
+        // Skip very small segments (less than 30 seconds)
+        if (slot.durationMillis < 30000) return@forEach
+
+        val lastSlot = mergedSlots.lastOrNull()
+        if (lastSlot != null) {
+            // Check for overlap
+            if (slot.startTime.before(lastSlot.endTime)) {
+                // If same activity type, extend the previous slot
+                if (slot.activityType == lastSlot.activityType) {
+                    val newEndTime = if (slot.endTime.after(lastSlot.endTime)) slot.endTime else lastSlot.endTime
+                    mergedSlots[mergedSlots.size - 1] = lastSlot.copy(
+                        endTime = newEndTime,
+                        durationMillis = newEndTime.time - lastSlot.startTime.time
+                    )
+                } else if (slot.endTime.time - slot.startTime.time > 60000) {
+                    // Different activity, only add if it's significant (> 1 minute)
+                    // Trim the start to not overlap
+                    val adjustedStartTime = lastSlot.endTime
+                    if (slot.endTime.after(adjustedStartTime)) {
+                        mergedSlots.add(
+                            slot.copy(
+                                startTime = adjustedStartTime,
+                                durationMillis = slot.endTime.time - adjustedStartTime.time
+                            )
+                        )
+                    }
+                }
+            } else {
+                // No overlap, add as is (if significant duration)
+                if (slot.durationMillis >= 60000) { // At least 1 minute
+                    mergedSlots.add(slot)
+                }
+            }
+        } else {
+            // First slot, add if significant
+            if (slot.durationMillis >= 60000) {
+                mergedSlots.add(slot)
+            }
         }
     }
+
+    return mergedSlots
 }
 
 @Composable
@@ -573,80 +782,6 @@ fun InfoRow(label: String, value: String) {
             fontWeight = FontWeight.Medium
         )
     }
-}
-
-suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<ActivityTimeSlot> {
-    val calendar = Calendar.getInstance()
-    calendar.time = date
-    calendar.set(Calendar.HOUR_OF_DAY, 0)
-    calendar.set(Calendar.MINUTE, 0)
-    calendar.set(Calendar.SECOND, 0)
-    calendar.set(Calendar.MILLISECOND, 0)
-    val startOfDay = calendar.time
-
-    calendar.add(Calendar.DAY_OF_MONTH, 1)
-    val endOfDay = calendar.time
-
-    // Get all activities for the day
-    val stillLocations = dao.getStillLocationsBetween(startOfDay, endOfDay)
-    val movementActivities = dao.getMovementActivitiesBetween(startOfDay, endOfDay)
-
-    val colors = mapOf(
-        "Still" to Color(0xFF9E9E9E),
-        "Walking" to Color(0xFF4CAF50),
-        "Running" to Color(0xFFFF9800),
-        "Driving" to Color(0xFF2196F3),
-        "Cycling" to Color(0xFF9C27B0),
-        "On Foot" to Color(0xFF8BC34A),
-        "Unknown" to Color(0xFF607D8B)
-    )
-
-    val allSlots = mutableListOf<ActivityTimeSlot>()
-
-    // Process still locations
-    stillLocations.forEach { location ->
-        val activityType = location.wasSupposedToBeActivity ?: "Still"
-        val duration = location.duration ?: 0L
-        val endTime = Date(location.timestamp.time + duration)
-
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = location.timestamp,
-                endTime = endTime,
-                durationMillis = duration,
-                color = colors[activityType] ?: colors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                )
-            )
-        )
-    }
-
-    // Process movement activities
-    movementActivities.forEach { activity ->
-        val activityType = if (activity.actuallyMoved) {
-            activity.activityType
-        } else {
-            "Still (${activity.activityType})"
-        }
-
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = activity.startTime,
-                endTime = activity.endTime,
-                durationMillis = activity.endTime.time - activity.startTime.time,
-                color = colors[activityType] ?: colors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                )
-            )
-        )
-    }
-
-    // Sort by start time
-    return allSlots.sortedBy { it.startTime }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

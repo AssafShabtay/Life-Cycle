@@ -324,6 +324,41 @@ class LocationService : Service() {
         val endTime = Date()
 
         if (startLoc != null && endLoc != null) {
+            val durationMillis = endTime.time - startTime.time
+            val durationMinutes = durationMillis / (1000 * 60)
+
+            // NEW: Filter out ON_FOOT activities shorter than 15 minutes
+            if (activityType == DetectedActivity.ON_FOOT && durationMinutes < 15) {
+                Log.d(TAG, "ON_FOOT activity duration (${durationMinutes}m) is less than 15 minutes - converting to still location")
+
+                // Delete the movement activity if it was created
+                currentActivityId?.let { id ->
+                    dao.deleteMovementActivity(id)
+                }
+
+                // Save as still location instead
+                val centerLoc = movementCenterLocation ?: startLoc
+                val stillLocation = StillLocation(
+                    latitude = centerLoc.latitude,
+                    longitude = centerLoc.longitude,
+                    timestamp = startTime,
+                    duration = durationMillis,
+                    wasSupposedToBeActivity = "On Foot (< 15 min)"
+                )
+                dao.insertStillLocation(stillLocation)
+
+                // Reset tracking variables
+                movementStartLocation = null
+                movementStartTime = null
+                movementCenterLocation = null
+                maxDistanceFromCenter = 0f
+                hasMovedBeyondThreshold = false
+                locationBuffer.clear()
+                currentActivityId = null
+                currentMovementActivity = null
+                return
+            }
+
             // Check if user actually moved beyond 100m radius
             if (!hasMovedBeyondThreshold && maxDistanceFromCenter < MOVEMENT_RADIUS_THRESHOLD) {
                 // User didn't actually move - convert to still location
@@ -340,7 +375,7 @@ class LocationService : Service() {
                     latitude = centerLoc.latitude,
                     longitude = centerLoc.longitude,
                     timestamp = startTime,
-                    duration = endTime.time - startTime.time,
+                    duration = durationMillis,
                     wasSupposedToBeActivity = getActivityName(activityType)
                 )
                 dao.insertStillLocation(stillLocation)
@@ -392,7 +427,6 @@ class LocationService : Service() {
         currentActivityId = null
         currentMovementActivity = null
     }
-
     private fun createLocationCallback() {
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
