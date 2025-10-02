@@ -104,7 +104,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private var currentActivityState by mutableStateOf("Unknown")
-    private var isTrackingActive by mutableStateOf(false)
     private var canTrackState by mutableStateOf(false)
     private var currentLocationSlot by mutableStateOf<LocationSlot?>(null)
 
@@ -129,6 +128,8 @@ class MainActivity : ComponentActivity() {
                 setupUI(canTrack = true)
                 setupBroadcastReceiver()
                 setupActivityRecognition()
+                // Automatically start tracking when app opens with permissions
+                startLocationTracking()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in onCreate: ${e.message}", e)
@@ -145,25 +146,6 @@ class MainActivity : ComponentActivity() {
                 MainScreen(
                     canTrack = canTrackState,
                     currentActivityState = currentActivityState,
-                    isTrackingActive = isTrackingActive,
-                    onStartTracking = {
-                        if (hasRequiredPermissions()) {
-                            startLocationTracking()
-                            isTrackingActive = true
-                        } else {
-                            Toast.makeText(
-                                this,
-                                "Please grant permissions first",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                            startActivity(Intent(this, PermissionsActivity::class.java))
-                        }
-                    },
-                    onStopTracking = {
-                        stopLocationTracking()
-                        isTrackingActive = false
-                        currentActivityState = "Unknown"
-                    },
                     onViewDatabase = {
                         try {
                             startActivity(Intent(this, DatabaseViewerActivity::class.java))
@@ -191,10 +173,7 @@ class MainActivity : ComponentActivity() {
     fun MainScreen(
         canTrack: Boolean,
         currentActivityState: String,
-        isTrackingActive: Boolean,
         currentLocationSlot: LocationSlot?,
-        onStartTracking: () -> Unit,
-        onStopTracking: () -> Unit,
         onViewDatabase: () -> Unit,
         onManagePermissions: () -> Unit,
         onGenerateData: () -> Unit,
@@ -232,9 +211,10 @@ class MainActivity : ComponentActivity() {
                 )
 
                 Text(
-                    text = "Tracking: ${if (isTrackingActive) "Active" else "Inactive"}",
+                    text = "Tracking: ${if (canTrack) "Active" else "Inactive"}",
                     fontSize = 16.sp,
-                    modifier = Modifier.padding(bottom = 16.dp)
+                    modifier = Modifier.padding(bottom = 16.dp),
+                    color = if (canTrack) Color(0xFF4CAF50) else Color(0xFFFF9800)
                 )
 
                 // Current Location Slot Display
@@ -279,7 +259,7 @@ class MainActivity : ComponentActivity() {
 
                 if (!canTrack) {
                     Text(
-                        text = "⚠️ Permissions needed for tracking",
+                        text = "⚠ Permissions needed for tracking",
                         fontSize = 14.sp,
                         color = Color.Red,
                         modifier = Modifier.padding(bottom = 16.dp)
@@ -288,24 +268,7 @@ class MainActivity : ComponentActivity() {
 
                 Divider(modifier = Modifier.padding(vertical = 16.dp))
 
-                // Control Buttons
-                Button(
-                    onClick = onStartTracking,
-                    enabled = !isTrackingActive && canTrack,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                ) {
-                    Text("Start Tracking")
-                }
-
-                Button(
-                    onClick = onStopTracking,
-                    enabled = isTrackingActive,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                ) {
-                    Text("Stop Tracking")
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
+                // Navigation Buttons
 
                 // Database Viewer Button
                 Button(
@@ -314,8 +277,6 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Text("View Database")
                 }
-
-                Spacer(modifier = Modifier.height(16.dp))
 
                 // Permissions Settings Button
                 Button(
@@ -367,7 +328,8 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(top = 16.dp)
                 )
                 Text(
-                    text = "• Still locations are saved automatically\n" +
+                    text = "• Tracking starts automatically when permissions are granted\n" +
+                            "• Still locations are saved automatically\n" +
                             "• Movement activities track start/end locations\n" +
                             "• Activities within 100m radius are marked as 'still'\n" +
                             "• Tap 'Generate Example Data' to test the pie chart",
@@ -393,6 +355,9 @@ class MainActivity : ComponentActivity() {
                 setupBroadcastReceiver()
                 setupActivityRecognition()
             }
+
+            // Ensure tracking is running
+            startLocationTracking()
         } else {
             // Update UI to show limited functionality
             setupUI(canTrack = false)
@@ -464,16 +429,8 @@ class MainActivity : ComponentActivity() {
                 receiverRegistered = false
             }
 
-            // Clean up activity recognition with permission check
-            if (hasRequiredPermissions()) {
-                activityRecognitionPendingIntent?.let { pendingIntent ->
-                    try {
-                        activityRecognitionClient?.removeActivityTransitionUpdates(pendingIntent)
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "Security exception removing activity updates: ${e.message}")
-                    }
-                }
-            }
+            // Note: We don't stop the location service on destroy to keep it running
+            // The service will continue running in the background
         } catch (e: Exception) {
             Log.e(TAG, "Error in onDestroy: ${e.message}")
         }
@@ -565,36 +522,9 @@ class MainActivity : ComponentActivity() {
             } else {
                 startService(intent)
             }
-            Log.d(TAG, "Location tracking started")
+            Log.d(TAG, "Location tracking started automatically")
         } catch (e: Exception) {
             Log.e(TAG, "Error starting location tracking: ${e.message}")
-            Toast.makeText(this, "Failed to start tracking", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun stopLocationTracking() {
-        try {
-            val intent = Intent(this, LocationService::class.java)
-            stopService(intent)
-
-            // Remove activity transition updates with permission check
-            if (hasRequiredPermissions()) {
-                activityRecognitionPendingIntent?.let { pendingIntent ->
-                    try {
-                        activityRecognitionClient?.removeActivityTransitionUpdates(pendingIntent)
-                            ?.addOnSuccessListener {
-                                Log.d(TAG, "Activity transition updates removed successfully")
-                            }
-                            ?.addOnFailureListener { e ->
-                                Log.e(TAG, "Failed to remove activity transition updates: ${e.message}")
-                            }
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "Security exception removing activity updates: ${e.message}")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping location tracking: ${e.message}")
         }
     }
 

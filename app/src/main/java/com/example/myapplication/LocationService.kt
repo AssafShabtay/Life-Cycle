@@ -129,7 +129,7 @@ class LocationService : Service() {
         saveRunnable = object : Runnable {
             override fun run() {
                 serviceScope.launch {
-                    saveCurrentActivityProgress()
+                    updateCurrentActivityProgress()
                 }
                 saveHandler.postDelayed(this, SAVE_INTERVAL)
             }
@@ -143,46 +143,37 @@ class LocationService : Service() {
         }
     }
 
-    private suspend fun saveCurrentActivityProgress() {
+    private suspend fun updateCurrentActivityProgress() {
         try {
-            Log.d(TAG, "Saving current activity progress...")
+            Log.d(TAG, "Updating current activity progress...")
 
-            // Save still location progress
+            // Update still location progress
             if (currentActivity == DetectedActivity.STILL && stillStartTime != null && stillStartLocation != null) {
                 val duration = Date().time - stillStartTime!!.time
 
                 if (currentStillLocationId != null) {
-                    // Update existing still location
+                    // Update existing still location with current duration
                     val existingLocation = dao.getStillLocationById(currentStillLocationId!!)
                     existingLocation?.let {
                         val updated = it.copy(
                             duration = duration,
-                            timestamp = stillStartTime ?: Date() // Keep original start time
+                            latitude = lastKnownLocation?.latitude ?: it.latitude,
+                            longitude = lastKnownLocation?.longitude ?: it.longitude
                         )
                         dao.updateStillLocation(updated)
-                        Log.d(TAG, "Updated still location with duration: ${duration / 1000}s")
+                        Log.d(TAG, "Updated still location duration: ${duration / 1000}s")
                     }
-                } else {
-                    // Create new still location record
-                    val stillLocation = StillLocation(
-                        latitude = stillStartLocation!!.latitude,
-                        longitude = stillStartLocation!!.longitude,
-                        timestamp = stillStartTime ?: Date(),
-                        duration = duration
-                    )
-                    currentStillLocationId = dao.insertStillLocation(stillLocation)
-                    Log.d(TAG, "Created new still location record, ID: $currentStillLocationId")
                 }
             }
 
-            // Save movement activity progress
+            // Update movement activity progress
             if (currentActivity in MOVEMENT_ACTIVITIES && movementStartTime != null && movementStartLocation != null) {
                 val endLocation = lastKnownLocation ?: movementStartLocation
                 val distance = movementStartLocation!!.distanceTo(endLocation!!)
                 val currentTime = Date()
 
                 if (currentActivityId != null && currentMovementActivity != null) {
-                    // Update existing movement activity
+                    // Update existing movement activity with current progress
                     val updated = currentMovementActivity!!.copy(
                         endLatitude = endLocation.latitude,
                         endLongitude = endLocation.longitude,
@@ -192,23 +183,7 @@ class LocationService : Service() {
                     )
                     dao.updateMovementActivity(updated)
                     currentMovementActivity = updated
-                    Log.d(TAG, "Updated movement activity, distance: ${distance}m")
-                } else {
-                    // Create new movement activity record
-                    val movementActivity = MovementActivity(
-                        activityType = getActivityName(currentActivity),
-                        startLatitude = movementStartLocation!!.latitude,
-                        startLongitude = movementStartLocation!!.longitude,
-                        endLatitude = endLocation.latitude,
-                        endLongitude = endLocation.longitude,
-                        startTime = movementStartTime ?: Date(),
-                        endTime = currentTime,
-                        distance = distance,
-                        actuallyMoved = hasMovedBeyondThreshold || maxDistanceFromCenter > MOVEMENT_RADIUS_THRESHOLD
-                    )
-                    currentActivityId = dao.insertMovementActivity(movementActivity)
-                    currentMovementActivity = movementActivity.copy(id = currentActivityId!!)
-                    Log.d(TAG, "Created new movement activity record, ID: $currentActivityId")
+                    Log.d(TAG, "Updated movement activity progress, distance: ${distance}m")
                 }
 
                 // Save buffered location tracks
@@ -217,7 +192,7 @@ class LocationService : Service() {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error saving activity progress: ${e.message}", e)
+            Log.e(TAG, "Error updating activity progress: ${e.message}", e)
         }
     }
 
@@ -235,14 +210,14 @@ class LocationService : Service() {
                 // Save any previous activity before starting new one
                 savePendingData()
 
-                // Entering a new activity
+                // Entering a new activity - create database record immediately
                 if (activityType == DetectedActivity.STILL) {
                     startStillTracking()
                 } else if (activityType in MOVEMENT_ACTIVITIES) {
                     startMovementTracking(activityType)
                 }
             } else {
-                // Exiting an activity - save final state
+                // Exiting an activity - finalize the record
                 if (previousActivity == DetectedActivity.STILL) {
                     endStillTracking()
                 } else if (previousActivity in MOVEMENT_ACTIVITIES) {
@@ -263,38 +238,41 @@ class LocationService : Service() {
     }
 
     private suspend fun startStillTracking() {
-        Log.d(TAG, "Starting still tracking")
+        Log.d(TAG, "Starting still tracking - creating database record immediately")
+
         stillStartLocation = lastKnownLocation
         stillStartTime = Date()
-        currentStillLocationId = null // Will be assigned on first save
+
+        // Create database record immediately
+        if (stillStartLocation != null) {
+            val stillLocation = StillLocation(
+                latitude = stillStartLocation!!.latitude,
+                longitude = stillStartLocation!!.longitude,
+                timestamp = stillStartTime!!,
+                duration = 0L // Start with 0 duration, will be updated
+            )
+            currentStillLocationId = dao.insertStillLocation(stillLocation)
+            Log.d(TAG, "Created still location record with ID: $currentStillLocationId")
+        }
     }
 
     private suspend fun endStillTracking() {
-        Log.d(TAG, "Ending still tracking")
+        Log.d(TAG, "Ending still tracking - finalizing database record")
 
-        // Save final state if not already saved
-        if (stillStartLocation != null && stillStartTime != null) {
+        // Finalize the still location record
+        if (stillStartLocation != null && stillStartTime != null && currentStillLocationId != null) {
             val duration = Date().time - stillStartTime!!.time
+            val existingLocation = dao.getStillLocationById(currentStillLocationId!!)
 
-            if (currentStillLocationId != null) {
-                // Update existing record with final duration
-                val existingLocation = dao.getStillLocationById(currentStillLocationId!!)
-                existingLocation?.let {
-                    val updated = it.copy(duration = duration)
-                    dao.updateStillLocation(updated)
-                }
-            } else {
-                // Create new record if it wasn't saved periodically
-                val stillLocation = StillLocation(
-                    latitude = stillStartLocation!!.latitude,
-                    longitude = stillStartLocation!!.longitude,
-                    timestamp = stillStartTime ?: Date(),
-                    duration = duration
+            existingLocation?.let {
+                val finalLocation = it.copy(
+                    duration = duration,
+                    latitude = lastKnownLocation?.latitude ?: it.latitude,
+                    longitude = lastKnownLocation?.longitude ?: it.longitude
                 )
-                dao.insertStillLocation(stillLocation)
+                dao.updateStillLocation(finalLocation)
+                Log.d(TAG, "Finalized still location: duration ${duration / 1000}s")
             }
-
-            Log.d(TAG, "Saved final still location: ${stillStartLocation!!.latitude}, ${stillStartLocation!!.longitude}")
         }
 
         // Reset tracking variables
@@ -304,39 +282,54 @@ class LocationService : Service() {
     }
 
     private suspend fun startMovementTracking(activityType: Int) {
-        Log.d(TAG, "Starting movement tracking for ${getActivityName(activityType)}")
+        Log.d(TAG, "Starting movement tracking for ${getActivityName(activityType)} - creating database record immediately")
+
         movementStartLocation = lastKnownLocation
         movementStartTime = Date()
         movementCenterLocation = lastKnownLocation
         maxDistanceFromCenter = 0f
         hasMovedBeyondThreshold = false
         locationBuffer.clear()
-        currentActivityId = null // Will be assigned on first save
-        currentMovementActivity = null
+
+        // Create database record immediately
+        if (movementStartLocation != null) {
+            val initialActivity = MovementActivity(
+                activityType = getActivityName(activityType),
+                startLatitude = movementStartLocation!!.latitude,
+                startLongitude = movementStartLocation!!.longitude,
+                endLatitude = movementStartLocation!!.latitude, // Initially same as start
+                endLongitude = movementStartLocation!!.longitude, // Initially same as start
+                startTime = movementStartTime!!,
+                endTime = movementStartTime!!, // Initially same as start
+                distance = 0f, // Start with 0 distance
+                actuallyMoved = false // Initially hasn't moved
+            )
+            currentActivityId = dao.insertMovementActivity(initialActivity)
+            currentMovementActivity = initialActivity.copy(id = currentActivityId!!)
+            Log.d(TAG, "Created movement activity record with ID: $currentActivityId")
+        }
     }
 
     private suspend fun endMovementTracking(activityType: Int) {
-        Log.d(TAG, "Ending movement tracking for ${getActivityName(activityType)}")
+        Log.d(TAG, "Ending movement tracking for ${getActivityName(activityType)} - finalizing database record")
 
         val startLoc = movementStartLocation
         val endLoc = lastKnownLocation
         val startTime = movementStartTime ?: Date()
         val endTime = Date()
 
-        if (startLoc != null && endLoc != null) {
+        if (startLoc != null && endLoc != null && currentActivityId != null) {
             val durationMillis = endTime.time - startTime.time
             val durationMinutes = durationMillis / (1000 * 60)
 
-            // NEW: Filter out ON_FOOT activities shorter than 15 minutes
+            // Handle ON_FOOT activities shorter than 15 minutes
             if (activityType == DetectedActivity.ON_FOOT && durationMinutes < 15) {
                 Log.d(TAG, "ON_FOOT activity duration (${durationMinutes}m) is less than 15 minutes - converting to still location")
 
-                // Delete the movement activity if it was created
-                currentActivityId?.let { id ->
-                    dao.deleteMovementActivity(id)
-                }
+                // Delete the movement activity record
+                dao.deleteMovementActivity(currentActivityId!!)
 
-                // Save as still location instead
+                // Create a still location instead
                 val centerLoc = movementCenterLocation ?: startLoc
                 val stillLocation = StillLocation(
                     latitude = centerLoc.latitude,
@@ -346,30 +339,14 @@ class LocationService : Service() {
                     wasSupposedToBeActivity = "On Foot (< 15 min)"
                 )
                 dao.insertStillLocation(stillLocation)
-
-                // Reset tracking variables
-                movementStartLocation = null
-                movementStartTime = null
-                movementCenterLocation = null
-                maxDistanceFromCenter = 0f
-                hasMovedBeyondThreshold = false
-                locationBuffer.clear()
-                currentActivityId = null
-                currentMovementActivity = null
-                return
-            }
-
-            // Check if user actually moved beyond 100m radius
-            if (!hasMovedBeyondThreshold && maxDistanceFromCenter < MOVEMENT_RADIUS_THRESHOLD) {
+            } else if (!hasMovedBeyondThreshold && maxDistanceFromCenter < MOVEMENT_RADIUS_THRESHOLD) {
                 // User didn't actually move - convert to still location
                 Log.d(TAG, "User stayed within ${MOVEMENT_RADIUS_THRESHOLD}m radius - converting to still location")
 
-                // Delete the movement activity if it was created
-                currentActivityId?.let { id ->
-                    dao.deleteMovementActivity(id)
-                }
+                // Delete the movement activity record
+                dao.deleteMovementActivity(currentActivityId!!)
 
-                // Save as still location instead
+                // Create a still location instead
                 val centerLoc = movementCenterLocation ?: startLoc
                 val stillLocation = StillLocation(
                     latitude = centerLoc.latitude,
@@ -379,41 +356,21 @@ class LocationService : Service() {
                     wasSupposedToBeActivity = getActivityName(activityType)
                 )
                 dao.insertStillLocation(stillLocation)
-            } else if (currentActivityId != null && currentMovementActivity != null) {
-                // Update final state of existing movement activity
+            } else {
+                // Finalize the movement activity with actual movement
                 val distance = startLoc.distanceTo(endLoc)
-                val updated = currentMovementActivity!!.copy(
+                val finalActivity = currentMovementActivity!!.copy(
                     endLatitude = endLoc.latitude,
                     endLongitude = endLoc.longitude,
                     endTime = endTime,
                     distance = distance,
                     actuallyMoved = true
                 )
-                dao.updateMovementActivity(updated)
+                dao.updateMovementActivity(finalActivity)
+                Log.d(TAG, "Finalized movement activity: distance ${distance}m, duration ${durationMinutes}min")
 
                 // Save any remaining location tracks
                 flushLocationBuffer()
-            } else if (currentActivityId == null) {
-                // Create new movement activity if it wasn't saved periodically
-                val distance = startLoc.distanceTo(endLoc)
-                val movementActivity = MovementActivity(
-                    activityType = getActivityName(activityType),
-                    startLatitude = startLoc.latitude,
-                    startLongitude = startLoc.longitude,
-                    endLatitude = endLoc.latitude,
-                    endLongitude = endLoc.longitude,
-                    startTime = startTime,
-                    endTime = endTime,
-                    distance = distance,
-                    actuallyMoved = true
-                )
-                val activityId = dao.insertMovementActivity(movementActivity)
-
-                // Save location tracks
-                if (locationBuffer.isNotEmpty()) {
-                    val tracks = locationBuffer.map { it.copy(activityId = activityId) }
-                    dao.insertLocationTracks(tracks)
-                }
             }
         }
 
@@ -427,6 +384,7 @@ class LocationService : Service() {
         currentActivityId = null
         currentMovementActivity = null
     }
+
     private fun createLocationCallback() {
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
@@ -453,12 +411,25 @@ class LocationService : Service() {
     }
 
     private suspend fun handleStillLocation(location: Location) {
-        // If we don't have a still start location, set it
+        // Update the current still location if we have one
         if (stillStartLocation == null) {
             stillStartLocation = location
             stillStartTime = Date()
+
+            // Create initial database record if it doesn't exist
+            if (currentStillLocationId == null) {
+                val stillLocation = StillLocation(
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    timestamp = stillStartTime!!,
+                    duration = 0L
+                )
+                currentStillLocationId = dao.insertStillLocation(stillLocation)
+                Log.d(TAG, "Created still location record on first location update")
+            }
         }
-        // Update location if user moved slightly while still
+
+        // Update location for minor movements while still
         stillStartLocation = location
     }
 
@@ -503,14 +474,14 @@ class LocationService : Service() {
     }
 
     private suspend fun savePendingData() {
-        // Save any pending still location
-        if (currentActivity == DetectedActivity.STILL) {
-            saveCurrentActivityProgress()
+        // Update any pending still location
+        if (currentActivity == DetectedActivity.STILL && currentStillLocationId != null) {
+            updateCurrentActivityProgress()
         }
 
-        // Save any pending movement activity
-        if (currentActivity in MOVEMENT_ACTIVITIES) {
-            saveCurrentActivityProgress()
+        // Update any pending movement activity
+        if (currentActivity in MOVEMENT_ACTIVITIES && currentActivityId != null) {
+            updateCurrentActivityProgress()
         }
     }
 

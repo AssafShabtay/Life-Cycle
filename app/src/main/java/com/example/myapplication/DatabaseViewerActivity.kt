@@ -12,13 +12,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -41,6 +39,8 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -59,6 +59,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.ui.draw.scale
 import android.widget.Toast
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DirectionsBike
@@ -92,11 +93,21 @@ import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
+
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.draw.rotate
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.MapUiSettings
+import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.rememberCameraPositionState
+import com.google.maps.android.compose.rememberMarkerState
 import com.example.myapplication.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
@@ -132,8 +143,31 @@ data class ActivityTimeSlot(
     val startTime: Date,
     val endTime: Date,
     val durationMillis: Long,
-    val color: Color
+    var color: Color,
+    val latitude: Double? = null,
+    val longitude: Double? = null
 )
+
+private const val ACTIVITY_COLOR_PREFS = "activity_color_preferences"
+
+private fun saveActivityColorPreference(context: Context, activityType: String, color: Color) {
+    context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putInt(activityType, color.toArgb())
+        .apply()
+}
+
+private fun applySavedColors(context: Context, slots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
+    if (slots.isEmpty()) return slots
+    val preferences = context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
+    return slots.map { slot ->
+        if (preferences.contains(slot.activityType)) {
+            slot.copy(color = Color(preferences.getInt(slot.activityType, 0).toLong()))
+        } else {
+            slot
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -148,7 +182,8 @@ fun DatabaseViewer(dao: ActivityDao) {
     LaunchedEffect(selectedDate) {
         scope.launch {
             try {
-                activityTimeSlots = calculateActivityTimeSlots(dao, selectedDate)
+                val slots = calculateActivityTimeSlots(dao, selectedDate)
+                activityTimeSlots = applySavedColors(context, slots)
             } catch (e: Exception) {
                 Log.e("DatabaseViewer", "Error loading data: ${e.message}")
                 activityTimeSlots = emptyList()
@@ -157,19 +192,28 @@ fun DatabaseViewer(dao: ActivityDao) {
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Title
         TopAppBar(
             title = { Text("24-Hour Activity Clock") }
         )
 
-        // Pie chart content
         DailyActivityPieChartWithNavigation(
             activityTimeSlots = activityTimeSlots,
             selectedDate = selectedDate,
             onDateChange = { newDate ->
                 selectedDate = newDate
                 scope.launch {
-                    activityTimeSlots = calculateActivityTimeSlots(dao, newDate)
+                    val slots = calculateActivityTimeSlots(dao, newDate)
+                    activityTimeSlots = applySavedColors(context, slots)
+                }
+            },
+            onColorUpdate = { slot, newColor ->
+                saveActivityColorPreference(context, slot.activityType, newColor)
+                activityTimeSlots = activityTimeSlots.map {
+                    if (it.activityType == slot.activityType) {
+                        it.copy(color = newColor)
+                    } else {
+                        it
+                    }
                 }
             },
             context = context
@@ -183,10 +227,9 @@ fun DailyActivityPieChartWithNavigation(
     activityTimeSlots: List<ActivityTimeSlot>,
     selectedDate: Date,
     onDateChange: (Date) -> Unit,
+    onColorUpdate: (ActivityTimeSlot, Color) -> Unit,
     context: Context
 ) {
-    val dateFormat = SimpleDateFormat("EEEE, MMMM dd, yyyy", Locale.getDefault())
-    var showDatePicker by remember { mutableStateOf(false) }
     var selectedSlot by remember { mutableStateOf<ActivityTimeSlot?>(null) }
     var showLocationSlotDialog by remember { mutableStateOf(false) }
 
@@ -197,37 +240,13 @@ fun DailyActivityPieChartWithNavigation(
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Date Selection Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            onClick = { showDatePicker = true }
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "Selected Date",
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = dateFormat.format(selectedDate),
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                Icon(
-                    imageVector = Icons.Default.DateRange,
-                    contentDescription = "Select Date",
-                    tint = MaterialTheme.colorScheme.primary
-                )
+        // Calendar Date Selector
+        CalendarDateSelector(
+            selectedDate = selectedDate,
+            onDateSelected = { newDate ->
+                onDateChange(newDate)
             }
-        }
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -238,44 +257,14 @@ fun DailyActivityPieChartWithNavigation(
             modifier = Modifier.padding(bottom = 16.dp)
         )
 
-        // Clock Labels and Pie Chart Container
+        // Clock and Pie Chart Container
         Box(
             modifier = Modifier
-                .size(340.dp)
+                .fillMaxWidth()
+                .aspectRatio(1f)
                 .padding(20.dp),
             contentAlignment = Alignment.Center
         ) {
-            // Time labels around the clock
-            Text(
-                text = "00:00",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.TopCenter)
-                    .offset(y = (-15).dp)
-            )
-            Text(
-                text = "06:00",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.CenterEnd)
-                    .offset(x = 15.dp)
-            )
-            Text(
-                text = "12:00",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.BottomCenter)
-                    .offset(y = 15.dp)
-            )
-            Text(
-                text = "18:00",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.CenterStart)
-                    .offset(x = (-15).dp)
-            )
-
-            // The actual pie chart with click handler
             AnimatedPieChart(
                 data = activityTimeSlots,
                 modifier = Modifier.fillMaxSize(),
@@ -303,12 +292,463 @@ fun DailyActivityPieChartWithNavigation(
                 showLocationSlotDialog = false
                 selectedSlot = null
             },
-            onCreateSlot = {
-                showLocationSlotDialog = false
-                selectedSlot = null
+            onColorChange = { newColor ->
+                selectedSlot?.let { slot ->
+                    onColorUpdate(slot, newColor)
+                }
             }
         )
     }
+}
+
+@Composable
+fun CalendarDateSelector(
+    selectedDate: Date,
+    onDateSelected: (Date) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val calendar = Calendar.getInstance()
+    calendar.time = selectedDate
+
+    var currentMonth by remember { mutableStateOf(calendar.get(Calendar.MONTH)) }
+    var currentYear by remember { mutableStateOf(calendar.get(Calendar.YEAR)) }
+    var expandedCalendar by remember { mutableStateOf(false) }
+
+    val dateFormat = SimpleDateFormat("EEEE, MMMM dd, yyyy", Locale.getDefault())
+    val monthFormat = SimpleDateFormat("MMMM yyyy", Locale.getDefault())
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        // Selected date header (collapsible)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = { expandedCalendar = !expandedCalendar },
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = dateFormat.format(selectedDate).split(",")[0],
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Normal,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = dateFormat.format(selectedDate).split(",").drop(1).joinToString(",").trim(),
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
+                Icon(
+                    imageVector = if (expandedCalendar) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (expandedCalendar) "Collapse" else "Expand",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        // Expandable Calendar Grid
+        if (expandedCalendar) {
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    // Month/Year header with navigation
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = {
+                            if (currentMonth == 0) {
+                                currentMonth = 11
+                                currentYear--
+                            } else {
+                                currentMonth--
+                            }
+                        }) {
+                            Icon(Icons.Default.ExpandLess, "Previous month",
+                                modifier = Modifier.rotate(-90f))
+                        }
+
+                        Text(
+                            text = monthFormat.format(Calendar.getInstance().apply {
+                                set(Calendar.MONTH, currentMonth)
+                                set(Calendar.YEAR, currentYear)
+                            }.time),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        IconButton(onClick = {
+                            if (currentMonth == 11) {
+                                currentMonth = 0
+                                currentYear++
+                            } else {
+                                currentMonth++
+                            }
+                        }) {
+                            Icon(Icons.Default.ExpandMore, "Next month",
+                                modifier = Modifier.rotate(-90f))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Day of week headers
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        listOf("S", "M", "T", "W", "T", "F", "S").forEach { day ->
+                            Text(
+                                text = day,
+                                modifier = Modifier.weight(1f),
+                                textAlign = TextAlign.Center,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Calendar grid
+                    CalendarGrid(
+                        month = currentMonth,
+                        year = currentYear,
+                        selectedDate = selectedDate,
+                        onDateSelected = { newDate ->
+                            onDateSelected(newDate)
+                            expandedCalendar = false
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CalendarDay(
+    day: Int,
+    isSelected: Boolean,
+    activityData: List<ActivityTimeSlot>?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clickable(onClick = onClick)
+            .padding(vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = day.toString(),
+            fontSize = 14.sp,
+            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+            color = if (isSelected) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurface
+        )
+
+        Spacer(modifier = Modifier.height(2.dp))
+
+        // Mini pie chart preview
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .clip(CircleShape)
+                .border(
+                    width = if (isSelected) 2.dp else 0.5.dp,
+                    color = if (isSelected) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.outlineVariant,
+                    shape = CircleShape
+                )
+        ) {
+            if (!activityData.isNullOrEmpty()) {
+                MiniPieChart(
+                    data = activityData,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                // Empty state - just a light background
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun MiniPieChart(
+    data: List<ActivityTimeSlot>,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val canvasSize = size.minDimension
+        val radius = canvasSize / 2f
+        val center = Offset(size.width / 2f, size.height / 2f)
+
+        // Draw background circle
+        drawCircle(
+            color = Color.LightGray.copy(alpha = 0.1f),
+            radius = radius,
+            center = center
+        )
+
+        if (data.isNotEmpty()) {
+            var startAngle = -90f
+
+            data.forEach { slot ->
+                val calendar = Calendar.getInstance()
+                calendar.time = slot.startTime
+                val startHour = calendar.get(Calendar.HOUR_OF_DAY)
+                val startMinute = calendar.get(Calendar.MINUTE)
+                val startMinutes = startHour * 60 + startMinute
+
+                calendar.time = slot.endTime
+                val endHour = calendar.get(Calendar.HOUR_OF_DAY)
+                val endMinute = calendar.get(Calendar.MINUTE)
+                var endMinutes = endHour * 60 + endMinute
+                if (endMinutes < startMinutes) endMinutes += 24 * 60
+
+                val sweepAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
+                val slotStartAngle = (startMinutes / (24f * 60f)) * 360f - 90f
+
+                if (sweepAngle > 0.5f) {
+                    drawArc(
+                        color = slot.color,
+                        startAngle = slotStartAngle,
+                        sweepAngle = sweepAngle,
+                        useCenter = true,
+                        topLeft = center - Offset(radius, radius),
+                        size = Size(radius * 2, radius * 2)
+                    )
+                }
+            }
+
+            // Draw a small white circle in the center for donut effect
+            drawCircle(
+                color = Color.White,
+                radius = radius * 0.3f,
+                center = center
+            )
+        }
+    }
+}
+
+@Composable
+fun CalendarGrid(
+    month: Int,
+    year: Int,
+    selectedDate: Date,
+    onDateSelected: (Date) -> Unit
+) {
+    val calendar = Calendar.getInstance()
+    calendar.set(Calendar.YEAR, year)
+    calendar.set(Calendar.MONTH, month)
+    calendar.set(Calendar.DAY_OF_MONTH, 1)
+
+    val firstDayOfWeek = calendar.get(Calendar.DAY_OF_WEEK) - 1
+    val daysInMonth = calendar.getActualMaximum(Calendar.DAY_OF_MONTH)
+
+    val selectedCal = Calendar.getInstance()
+    selectedCal.time = selectedDate
+    val selectedDay = selectedCal.get(Calendar.DAY_OF_MONTH)
+    val selectedMonth = selectedCal.get(Calendar.MONTH)
+    val selectedYear = selectedCal.get(Calendar.YEAR)
+
+    // Load activity data for all days in the month
+    val context = LocalContext.current
+    val database = remember { ActivityDatabase.getDatabase(context) }
+    val dao = remember { database.activityDao() }
+    var monthActivityData by remember { mutableStateOf<Map<Int, List<ActivityTimeSlot>>>(emptyMap()) }
+
+    LaunchedEffect(month, year) {
+        monthActivityData = loadMonthActivityData(dao, month, year)
+    }
+
+    val weeks = mutableListOf<List<Int>>()
+    var week = mutableListOf<Int>()
+
+    // Padding before first day
+    repeat(firstDayOfWeek) {
+        week.add(0)
+    }
+
+    // Fill days
+    for (day in 1..daysInMonth) {
+        week.add(day)
+        if (week.size == 7) {
+            weeks.add(week.toList())
+            week = mutableListOf()
+        }
+    }
+
+    // Pad last row
+    if (week.isNotEmpty()) {
+        while (week.size < 7) {
+            week.add(0)
+        }
+        weeks.add(week.toList())
+    }
+
+    Column {
+        weeks.forEach { weekDays ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                weekDays.forEach { day ->
+                    if (day == 0) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    } else {
+                        CalendarDay(
+                            day = day,
+                            isSelected = day == selectedDay &&
+                                    month == selectedMonth &&
+                                    year == selectedYear,
+                            activityData = monthActivityData[day]?.let { applySavedColors(context, it) },
+                            onClick = {
+                                val newDate = Calendar.getInstance().apply {
+                                    set(Calendar.YEAR, year)
+                                    set(Calendar.MONTH, month)
+                                    set(Calendar.DAY_OF_MONTH, day)
+                                    set(Calendar.HOUR_OF_DAY, 0)
+                                    set(Calendar.MINUTE, 0)
+                                    set(Calendar.SECOND, 0)
+                                    set(Calendar.MILLISECOND, 0)
+                                }.time
+                                onDateSelected(newDate)
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+    }
+}
+
+suspend fun loadMonthActivityData(
+    dao: ActivityDao,
+    month: Int,
+    year: Int
+): Map<Int, List<ActivityTimeSlot>> = withContext(Dispatchers.IO) {
+    val monthData = mutableMapOf<Int, List<ActivityTimeSlot>>()
+
+    val calendar = Calendar.getInstance()
+    calendar.set(Calendar.YEAR, year)
+    calendar.set(Calendar.MONTH, month)
+    calendar.set(Calendar.DAY_OF_MONTH, 1)
+    calendar.set(Calendar.HOUR_OF_DAY, 0)
+    calendar.set(Calendar.MINUTE, 0)
+    calendar.set(Calendar.SECOND, 0)
+    calendar.set(Calendar.MILLISECOND, 0)
+
+    val daysInMonth = calendar.getActualMaximum(Calendar.DAY_OF_MONTH)
+
+    for (day in 1..daysInMonth) {
+        calendar.set(Calendar.DAY_OF_MONTH, day)
+        val dayStart = calendar.time
+
+        calendar.add(Calendar.DAY_OF_MONTH, 1)
+        val dayEnd = calendar.time
+        calendar.add(Calendar.DAY_OF_MONTH, -1) // Reset for next iteration
+
+        try {
+            val slots = calculateActivityTimeSlotsForRange(dao, dayStart, dayEnd)
+            if (slots.isNotEmpty()) {
+                monthData[day] = slots
+            }
+        } catch (e: Exception) {
+            Log.e("CalendarGrid", "Error loading data for day $day: ${e.message}")
+        }
+    }
+
+    monthData
+}
+
+suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date, endDate: Date): List<ActivityTimeSlot> {
+    val stillLocations = dao.getStillLocationsBetween(startDate, endDate)
+    val movementActivities = dao.getMovementActivitiesBetween(startDate, endDate)
+
+    val colors = mapOf(
+        "Still" to Color(0xFF9E9E9E),
+        "Walking" to Color(0xFF4CAF50),
+        "Running" to Color(0xFFFF9800),
+        "Driving" to Color(0xFF2196F3),
+        "Cycling" to Color(0xFF9C27B0),
+        "On Foot" to Color(0xFF8BC34A),
+        "Unknown" to Color(0xFF607D8B)
+    )
+
+    val allSlots = mutableListOf<ActivityTimeSlot>()
+
+    stillLocations.forEach { location ->
+        val activityType = location.wasSupposedToBeActivity ?: "Still"
+        val duration = location.duration ?: 0L
+        val endTime = Date(location.timestamp.time + duration)
+
+        allSlots.add(
+            ActivityTimeSlot(
+                activityType = activityType,
+                startTime = location.timestamp,
+                endTime = endTime,
+                durationMillis = duration,
+                color = colors[activityType] ?: colors.getOrDefault(
+                    activityType.substringBefore(" ("),
+                    Color(0xFF795548)
+                ),
+                latitude = location.latitude,
+                longitude = location.longitude
+            )
+        )
+    }
+
+    movementActivities.forEach { activity ->
+        val activityType = if (activity.actuallyMoved) {
+            activity.activityType
+        } else {
+            "Still (${activity.activityType})"
+        }
+
+        allSlots.add(
+            ActivityTimeSlot(
+                activityType = activityType,
+                startTime = activity.startTime,
+                endTime = activity.endTime,
+                durationMillis = activity.endTime.time - activity.startTime.time,
+                color = colors[activityType] ?: colors.getOrDefault(
+                    activityType.substringBefore(" ("),
+                    Color(0xFF795548)
+                ),
+                latitude = activity.startLatitude,
+                longitude = activity.startLongitude
+            )
+        )
+    }
+
+    return allSlots.sortedBy { it.startTime }
 }
 
 @Composable
@@ -324,12 +764,14 @@ fun AnimatedPieChart(
             textSize = 18f
             color = android.graphics.Color.WHITE
             textAlign = android.graphics.Paint.Align.CENTER
-            typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD
+            )
             isAntiAlias = true
         }
     }
 
-    // Store segment bounds for interaction
     data class SegmentBounds(
         val slot: ActivityTimeSlot,
         val startAngle: Float,
@@ -349,6 +791,14 @@ fun AnimatedPieChart(
         }
     }
 
+    val backgroundColor = MaterialTheme.colorScheme.background
+    val textColor = remember(backgroundColor) {
+        val luminance = 0.299 * backgroundColor.red +
+                0.587 * backgroundColor.green +
+                0.114 * backgroundColor.blue
+        if (luminance > 0.5) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+    }
+
     Canvas(
         modifier = modifier.pointerInput(data) {
             detectTapGestures { offset ->
@@ -364,18 +814,20 @@ fun AnimatedPieChart(
 
                 if (distance in innerRadius..radius) {
                     var clickAngle = kotlin.math.atan2(
-                        offset.y - centerY,
-                        offset.x - centerX
-                    ) * 180 / kotlin.math.PI - 90
+                        offset.x - centerX,
+                        -(offset.y - centerY)
+                    ) * 180 / kotlin.math.PI
 
                     if (clickAngle < 0) clickAngle += 360
 
                     segmentBounds.forEach { bounds ->
+                        val startAngle = bounds.startAngle
                         val endAngle = bounds.startAngle + bounds.sweepAngle
-                        val inSegment = if (bounds.startAngle <= endAngle) {
-                            clickAngle >= bounds.startAngle && clickAngle <= endAngle
+
+                        val inSegment = if (endAngle > startAngle) {
+                            clickAngle >= startAngle && clickAngle <= endAngle
                         } else {
-                            clickAngle >= bounds.startAngle || clickAngle <= endAngle
+                            clickAngle >= startAngle || clickAngle <= endAngle
                         }
 
                         if (inSegment) {
@@ -392,27 +844,16 @@ fun AnimatedPieChart(
         val innerRadius = radius * 0.55f
         val center = Offset(size.width / 2f, size.height / 2f)
 
-        // Clear bounds
         segmentBounds.clear()
 
-        // Background
-        drawCircle(
-            color = Color(0xFFF5F5F5),
-            radius = radius * 1.05f,
-            center = center
-        )
-
-        // Calculate total time
         val totalMinutes = data.sumOf { it.durationMillis } / (1000 * 60)
         val totalHours = totalMinutes / 60
         val remainingMinutes = totalMinutes % 60
 
-        // Draw segments - SIMPLIFIED APPROACH
         val strokeWidth = radius - innerRadius
         val middleRadius = (radius + innerRadius) / 2f
-        val minDisplayAngle = 8f // Minimum angle for text display
+        val minDisplayAngle = 8f
 
-        // Process segments with minimum visual size
         data class VisualSegment(
             val slot: ActivityTimeSlot,
             val startAngle: Float,
@@ -439,7 +880,6 @@ fun AnimatedPieChart(
             val sweepAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
             val startAngle = (startMinutes / (24f * 60f)) * 360f - 90f
 
-            // Only include if sweep angle is meaningful
             if (sweepAngle > 0.5f) {
                 val displayAngle = if (slot.durationMillis >= 15 * 60 * 1000 && sweepAngle < minDisplayAngle) {
                     minDisplayAngle
@@ -448,36 +888,26 @@ fun AnimatedPieChart(
                 }
 
                 visualSegments.add(
-                    VisualSegment(
-                        slot = slot,
-                        startAngle = startAngle,
-                        sweepAngle = sweepAngle,
-                        displayAngle = displayAngle
-                    )
+                    VisualSegment(slot, startAngle, sweepAngle, displayAngle)
                 )
                 accumulatedAngle += displayAngle
             }
         }
 
-        // Scale display angles if needed
         if (accumulatedAngle > 360f && visualSegments.isNotEmpty()) {
             val scale = 360f / accumulatedAngle
             visualSegments.replaceAll { it.copy(displayAngle = it.displayAngle * scale) }
         }
 
-        // Draw each segment
-        var currentAngle = -90f
         visualSegments.forEach { segment ->
-            val animatedSweep = segment.displayAngle * animationProgress
+            val animatedSweep = segment.sweepAngle * animationProgress
 
             if (animatedSweep > 0.5f) {
-                // Add small gap
                 val gapSize = if (animatedSweep > 2f) 0.5f else 0f
 
-                // Draw using simple arc
                 drawArc(
                     color = segment.slot.color,
-                    startAngle = currentAngle + gapSize,
+                    startAngle = segment.startAngle + gapSize,
                     sweepAngle = animatedSweep - (gapSize * 2),
                     useCenter = false,
                     topLeft = center - Offset(middleRadius, middleRadius),
@@ -488,21 +918,19 @@ fun AnimatedPieChart(
                     )
                 )
 
-                // Store bounds for click detection
                 segmentBounds.add(
                     SegmentBounds(
                         slot = segment.slot,
-                        startAngle = if (currentAngle < 0) currentAngle + 360 else currentAngle,
-                        sweepAngle = segment.displayAngle
+                        startAngle = segment.startAngle + 90,
+                        sweepAngle = segment.sweepAngle
                     )
                 )
 
-                // Draw text for 15+ minute segments
                 if (segment.slot.durationMillis >= 15 * 60 * 1000 &&
                     animationProgress > 0.8f &&
-                    segment.displayAngle >= 6f) {
+                    segment.sweepAngle >= 6f) {
 
-                    val midAngle = currentAngle + (segment.displayAngle / 2f)
+                    val midAngle = segment.startAngle + (segment.sweepAngle / 2f)
                     val midAngleRad = Math.toRadians(midAngle.toDouble())
 
                     val textX = center.x + (middleRadius * cos(midAngleRad)).toFloat()
@@ -521,24 +949,18 @@ fun AnimatedPieChart(
                         textPaint
                     )
                 }
-
-                currentAngle += segment.displayAngle
             }
         }
-
-        // Center circle
-        drawCircle(
-            color = Color.White,
-            radius = innerRadius * 0.9f,
-            center = center
-        )
 
         // Center text
         val centerTextPaint = android.graphics.Paint().apply {
             textSize = 42f
-            color = android.graphics.Color.BLACK
+            color = textColor
             textAlign = android.graphics.Paint.Align.CENTER
-            typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD
+            )
             isAntiAlias = true
         }
 
@@ -559,7 +981,7 @@ fun AnimatedPieChart(
             center.y + 30,
             android.graphics.Paint().apply {
                 textSize = 24f
-                color = android.graphics.Color.rgb(100, 100, 100)
+                color = textColor
                 textAlign = android.graphics.Paint.Align.CENTER
                 isAntiAlias = true
             }
@@ -579,7 +1001,6 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
     calendar.add(Calendar.DAY_OF_MONTH, 1)
     val endOfDay = calendar.time
 
-    // Get all activities for the day
     val stillLocations = dao.getStillLocationsBetween(startOfDay, endOfDay)
     val movementActivities = dao.getMovementActivitiesBetween(startOfDay, endOfDay)
 
@@ -595,7 +1016,6 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
 
     val allSlots = mutableListOf<ActivityTimeSlot>()
 
-    // Process still locations
     stillLocations.forEach { location ->
         val activityType = location.wasSupposedToBeActivity ?: "Still"
         val duration = location.duration ?: 0L
@@ -610,12 +1030,13 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                 color = colors[activityType] ?: colors.getOrDefault(
                     activityType.substringBefore(" ("),
                     Color(0xFF795548)
-                )
+                ),
+                latitude = location.latitude,
+                longitude = location.longitude
             )
         )
     }
 
-    // Process movement activities
     movementActivities.forEach { activity ->
         val activityType = if (activity.actuallyMoved) {
             activity.activityType
@@ -632,25 +1053,22 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                 color = colors[activityType] ?: colors.getOrDefault(
                     activityType.substringBefore(" ("),
                     Color(0xFF795548)
-                )
+                ),
+                latitude = activity.startLatitude,
+                longitude = activity.startLongitude
             )
         )
     }
 
-    // Sort by start time
     val sortedSlots = allSlots.sortedBy { it.startTime }
 
-    // CRITICAL: Merge overlapping segments and remove duplicates
     val mergedSlots = mutableListOf<ActivityTimeSlot>()
     sortedSlots.forEach { slot ->
-        // Skip very small segments (less than 30 seconds)
         if (slot.durationMillis < 30000) return@forEach
 
         val lastSlot = mergedSlots.lastOrNull()
         if (lastSlot != null) {
-            // Check for overlap
             if (slot.startTime.before(lastSlot.endTime)) {
-                // If same activity type, extend the previous slot
                 if (slot.activityType == lastSlot.activityType) {
                     val newEndTime = if (slot.endTime.after(lastSlot.endTime)) slot.endTime else lastSlot.endTime
                     mergedSlots[mergedSlots.size - 1] = lastSlot.copy(
@@ -658,8 +1076,6 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                         durationMillis = newEndTime.time - lastSlot.startTime.time
                     )
                 } else if (slot.endTime.time - slot.startTime.time > 60000) {
-                    // Different activity, only add if it's significant (> 1 minute)
-                    // Trim the start to not overlap
                     val adjustedStartTime = lastSlot.endTime
                     if (slot.endTime.after(adjustedStartTime)) {
                         mergedSlots.add(
@@ -671,13 +1087,11 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                     }
                 }
             } else {
-                // No overlap, add as is (if significant duration)
-                if (slot.durationMillis >= 60000) { // At least 1 minute
+                if (slot.durationMillis >= 60000) {
                     mergedSlots.add(slot)
                 }
             }
         } else {
-            // First slot, add if significant
             if (slot.durationMillis >= 60000) {
                 mergedSlots.add(slot)
             }
@@ -685,51 +1099,6 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
     }
 
     return mergedSlots
-}
-
-@Composable
-fun ActivityLegendItem(slot: ActivityTimeSlot) {
-    val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(16.dp)
-                    .background(slot.color, RoundedCornerShape(4.dp))
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Column {
-                Text(
-                    text = slot.activityType,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    text = "${timeFormat.format(slot.startTime)} - ${timeFormat.format(slot.endTime)}",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-
-        Column(
-            horizontalAlignment = Alignment.End
-        ) {
-            Text(
-                text = formatDuration(slot.durationMillis),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
 }
 
 @Composable
@@ -789,24 +1158,21 @@ fun InfoRow(label: String, value: String) {
 fun LocationSlotPopover(
     activitySlot: ActivityTimeSlot,
     onDismiss: () -> Unit,
-    onCreateSlot: () -> Unit,
+    onColorChange: (Color) -> Unit,
     anchorPosition: Offset? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
 
-    // State for customization options
     var slotName by remember { mutableStateOf(activitySlot.activityType) }
     var selectedIcon by remember { mutableStateOf(getDefaultIconForActivity(activitySlot.activityType)) }
     var selectedColor by remember { mutableStateOf(activitySlot.color) }
     var radius by remember { mutableStateOf(100f) }
     var notifyOnEnter by remember { mutableStateOf(true) }
     var notifyOnExit by remember { mutableStateOf(false) }
-    var isSaving by remember { mutableStateOf(false) }
-    var expanded by remember { mutableStateOf(false) }
+    var expandAdvanced by remember { mutableStateOf(false) }
 
-    // Available icons (compact set)
     val icons = listOf(
         "home" to Icons.Default.Home,
         "work" to Icons.Default.Work,
@@ -816,15 +1182,45 @@ fun LocationSlotPopover(
         "star" to Icons.Default.Star
     )
 
-    // Available colors (compact set)
     val colors = listOf(
-        Color(0xFF2196F3), // Blue
-        Color(0xFF4CAF50), // Green
-        Color(0xFFFF9800), // Orange
-        Color(0xFF9C27B0), // Purple
-        Color(0xFFE91E63), // Pink
-        Color(0xFF00BCD4)  // Cyan
+        Color(0xFF2196F3),
+        Color(0xFF4CAF50),
+        Color(0xFFFF9800),
+        Color(0xFF9C27B0),
+        Color(0xFFE91E63),
+        Color(0xFF00BCD4)
     )
+
+    val mapLatLng = remember(activitySlot.latitude, activitySlot.longitude) {
+        val lat = activitySlot.latitude
+        val lon = activitySlot.longitude
+        if (lat != null && lon != null) LatLng(lat, lon) else null
+    }
+    val showLocationMap = remember(activitySlot.activityType, mapLatLng) {
+        mapLatLng != null && activitySlot.activityType.startsWith("Still")
+    }
+
+    val autoSave: suspend () -> Unit = {
+        delay(500)
+        val target = mapLatLng
+        saveLocationSlot(
+            context = context,
+            name = slotName,
+            icon = selectedIcon,
+            color = selectedColor.toArgb(),
+            radius = radius,
+            notifyOnEnter = true,
+            notifyOnExit = false,
+            latitude = target?.latitude ?: 0.0,
+            longitude = target?.longitude ?: 0.0
+        )
+    }
+
+    LaunchedEffect(slotName, selectedIcon, selectedColor, radius) {
+        if (slotName.isNotBlank()) {
+            autoSave()
+        }
+    }
 
     DropdownMenu(
         expanded = true,
@@ -834,10 +1230,8 @@ fun LocationSlotPopover(
             .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
     ) {
         Column(
-            modifier = Modifier
-                .padding(16.dp)
+            modifier = Modifier.padding(16.dp)
         ) {
-            // Compact Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -875,9 +1269,39 @@ fun LocationSlotPopover(
 
             Spacer(modifier = Modifier.height(12.dp))
             Divider()
+            if (showLocationMap) {
+                val target = mapLatLng!!
+                Text("Location", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(8.dp))
+                val cameraPositionState = rememberCameraPositionState {
+                    position = CameraPosition.fromLatLngZoom(target, 16f)
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))
+                ) {
+                    GoogleMap(
+                        modifier = Modifier.fillMaxSize(),
+                        cameraPositionState = cameraPositionState,
+                        uiSettings = MapUiSettings(
+                            zoomControlsEnabled = false,
+                            myLocationButtonEnabled = false,
+                            scrollGesturesEnabled = false,
+                            zoomGesturesEnabled = false,
+                            tiltGesturesEnabled = false,
+                        )
+                    ) {
+                        Marker(state = rememberMarkerState(position = target), title = slotName)
+                    }
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Compact name input
             OutlinedTextField(
                 value = slotName,
                 onValueChange = { slotName = it },
@@ -889,7 +1313,6 @@ fun LocationSlotPopover(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Compact icon row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -919,7 +1342,6 @@ fun LocationSlotPopover(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Compact color row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -935,132 +1357,82 @@ fun LocationSlotPopover(
                                 else BorderStroke(0.5.dp, Color.Gray),
                                 CircleShape
                             )
-                            .clickable { selectedColor = color }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Compact radius control
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Radius:",
-                    fontSize = 12.sp,
-                    modifier = Modifier.width(45.dp)
-                )
-                Slider(
-                    value = radius,
-                    onValueChange = { radius = it },
-                    valueRange = 50f..300f,
-                    modifier = Modifier.weight(1f).height(24.dp),
-                    colors = SliderDefaults.colors(
-                        thumbColor = selectedColor,
-                        activeTrackColor = selectedColor
-                    )
-                )
-                Text(
-                    text = "${radius.roundToInt()}m",
-                    fontSize = 12.sp,
-                    modifier = Modifier.width(40.dp),
-                    textAlign = TextAlign.End
-                )
-            }
-
-            // Compact notification toggles
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Checkbox(
-                        checked = notifyOnEnter,
-                        onCheckedChange = { notifyOnEnter = it },
-                        modifier = Modifier.scale(0.8f),
-                        colors = CheckboxDefaults.colors(checkedColor = selectedColor)
-                    )
-                    Text("Entry", fontSize = 12.sp)
-                }
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Checkbox(
-                        checked = notifyOnExit,
-                        onCheckedChange = { notifyOnExit = it },
-                        modifier = Modifier.scale(0.8f),
-                        colors = CheckboxDefaults.colors(checkedColor = selectedColor)
-                    )
-                    Text("Exit", fontSize = 12.sp)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Compact action buttons
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                TextButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.weight(1f).height(36.dp)
-                ) {
-                    Text("Cancel", fontSize = 13.sp)
-                }
-
-                Button(
-                    onClick = {
-                        if (slotName.isNotBlank()) {
-                            isSaving = true
-                            scope.launch {
-                                saveLocationSlot(
-                                    context = context,
-                                    name = slotName,
-                                    icon = selectedIcon,
-                                    color = selectedColor.toArgb(),
-                                    radius = radius,
-                                    notifyOnEnter = notifyOnEnter,
-                                    notifyOnExit = notifyOnExit,
-                                    latitude = 0.0, // You'll need to get current location
-                                    longitude = 0.0  // You'll need to get current location
-                                )
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(
-                                        context,
-                                        "Location slot created: $slotName",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                    onCreateSlot()
-                                }
+                            .clickable {
+                                selectedColor = color
+                                onColorChange(color)
                             }
-                        }
-                    },
-                    modifier = Modifier.weight(1f).height(36.dp),
-                    enabled = slotName.isNotBlank() && !isSaving,
-                    colors = ButtonDefaults.buttonColors(containerColor = selectedColor),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expandAdvanced = !expandAdvanced },
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isSaving) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(14.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            Icons.Default.Save,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Save", fontSize = 13.sp)
+                    Text(
+                        text = "Advanced Settings",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Icon(
+                        imageVector = if (expandAdvanced) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (expandAdvanced) "Collapse" else "Expand",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            if (expandAdvanced) {
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Radius:",
+                                fontSize = 12.sp,
+                                modifier = Modifier.width(45.dp)
+                            )
+                            Slider(
+                                value = radius,
+                                onValueChange = { radius = it },
+                                valueRange = 50f..300f,
+                                modifier = Modifier.weight(1f).height(24.dp),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = selectedColor,
+                                    activeTrackColor = selectedColor
+                                )
+                            )
+                            Text(
+                                text = "${radius.roundToInt()}m",
+                                fontSize = 12.sp,
+                                modifier = Modifier.width(40.dp),
+                                textAlign = TextAlign.End
+                            )
+                        }
                     }
                 }
             }
@@ -1094,9 +1466,6 @@ suspend fun saveLocationSlot(
         val database = ActivityDatabase.getDatabase(context)
         val geofenceDao = database.geofenceDao()
 
-        // Get current location if available (you'll need to implement this)
-        // For now using placeholder coordinates
-
         val slot = LocationSlot(
             name = name,
             icon = icon,
@@ -1111,24 +1480,11 @@ suspend fun saveLocationSlot(
 
         val slotId = geofenceDao.insertLocationSlot(slot)
 
-        // Add geofence
         if (slot.isActive) {
             GeofenceManager.addGeofence(context, slot.copy(id = slotId))
         }
     } catch (e: Exception) {
         Log.e("LocationSlot", "Error saving location slot: ${e.message}")
-    }
-}
-
-fun getIconForActivity(activityType: String): ImageVector {
-    return when (activityType) {
-        "Still" -> Icons.Default.Home
-        "Walking" -> Icons.AutoMirrored.Filled.DirectionsWalk
-        "Running" -> Icons.AutoMirrored.Filled.DirectionsRun
-        "Driving" -> Icons.Default.DirectionsCar
-        "Cycling" -> Icons.AutoMirrored.Filled.DirectionsBike
-        "On Foot" -> Icons.AutoMirrored.Filled.DirectionsWalk
-        else -> Icons.AutoMirrored.Filled.Help
     }
 }
 
