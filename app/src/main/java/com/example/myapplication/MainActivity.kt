@@ -1,6 +1,7 @@
 package com.example.myapplication
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -9,6 +10,8 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -60,10 +63,21 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
     private var activityRecognitionClient: ActivityRecognitionClient? = null
     private var activityRecognitionPendingIntent: PendingIntent? = null
+    private var activityConfidencePendingIntent: PendingIntent? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val relaxActivityUpdatesRunnable = Runnable {
+        activityConfidencePendingIntent?.let { pending ->
+            activityRecognitionClient?.requestActivityUpdates(
+                TimeUnit.SECONDS.toMillis(12),
+                pending
+            )
+        }
+    }
     private lateinit var database: ActivityDatabase
     private lateinit var dao: ActivityDao
     private var receiverRegistered = false
@@ -154,14 +168,8 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(this, "Error opening database viewer", Toast.LENGTH_SHORT).show()
                         }
                     },
-                    onManagePermissions = {
-                        startActivity(Intent(this, PermissionsActivity::class.java))
-                    },
                     onGenerateData = {
                         generateExampleData()
-                    },
-                    onManageLocationSlots = {
-                        startActivity(Intent(this, LocationSlotsActivity::class.java))
                     },
                     currentLocationSlot = currentLocationSlot
                 )
@@ -175,9 +183,7 @@ class MainActivity : ComponentActivity() {
         currentActivityState: String,
         currentLocationSlot: LocationSlot?,
         onViewDatabase: () -> Unit,
-        onManagePermissions: () -> Unit,
         onGenerateData: () -> Unit,
-        onManageLocationSlots: () -> Unit
     ) {
         val scope = rememberCoroutineScope()
 
@@ -277,32 +283,6 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Text("View Database")
                 }
-
-                // Permissions Settings Button
-                Button(
-                    onClick = onManagePermissions,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                ) {
-                    Text("Manage Permissions")
-                }
-
-                // Location Slots Button
-                Button(
-                    onClick = onManageLocationSlots,
-                    modifier = Modifier.padding(vertical = 4.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.secondary
-                    )
-                ) {
-                    Icon(
-                        Icons.Default.LocationOn,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Manage Location Slots")
-                }
-
                 // Generate Example Data Button
                 Button(
                     onClick = {
@@ -364,6 +344,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private fun setupBroadcastReceiver() {
         try {
             if (!receiverRegistered) {
@@ -429,8 +410,18 @@ class MainActivity : ComponentActivity() {
                 receiverRegistered = false
             }
 
-            // Note: We don't stop the location service on destroy to keep it running
-            // The service will continue running in the background
+            activityRecognitionPendingIntent?.let { pending ->
+                activityRecognitionClient?.removeActivityTransitionUpdates(pending)
+                pending.cancel()
+            }
+            activityConfidencePendingIntent?.let { pending ->
+                activityRecognitionClient?.removeActivityUpdates(pending)
+                pending.cancel()
+            }
+            mainHandler.removeCallbacks(relaxActivityUpdatesRunnable)
+
+            activityRecognitionPendingIntent = null
+            activityConfidencePendingIntent = null
         } catch (e: Exception) {
             Log.e(TAG, "Error in onDestroy: ${e.message}")
         }
@@ -530,45 +521,101 @@ class MainActivity : ComponentActivity() {
 
     private fun setupActivityRecognition() {
         try {
-            // Only setup if permissions are granted
             if (!hasRequiredPermissions()) {
                 Log.w(TAG, "Skipping activity recognition setup - permissions not granted")
                 return
             }
 
             activityRecognitionClient = ActivityRecognition.getClient(this)
-            val intent = Intent(this, ActivityTransitionReceiver::class.java)
 
-            activityRecognitionPendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                PendingIntent.getBroadcast(
-                    this,
-                    0,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-                )
-            } else {
-                PendingIntent.getBroadcast(
-                    this,
-                    0,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT
-                )
+            val transitionIntent = Intent(this, ActivityTransitionReceiver::class.java).apply {
+                action = ActivityTransitionReceiver.ACTION_ACTIVITY_TRANSITION
             }
+            activityRecognitionPendingIntent = buildPendingIntent(transitionIntent, 1001)
 
-            activityRecognitionPendingIntent?.let { pendingIntent ->
+            val confidenceIntent = Intent(this, ActivityTransitionReceiver::class.java).apply {
+                action = ActivityTransitionReceiver.ACTION_ACTIVITY_CONFIDENCE
+            }
+            activityConfidencePendingIntent = buildPendingIntent(confidenceIntent, 1002)
+
+            activityRecognitionPendingIntent?.let { pending ->
                 activityRecognitionClient?.requestActivityTransitionUpdates(
                     getActivityTransitionRequest(),
-                    pendingIntent
+                    pending
                 )?.addOnSuccessListener {
                     Log.d(TAG, "Activity transition updates registered successfully.")
                 }?.addOnFailureListener { e ->
                     Log.e(TAG, "Failed to register activity transition updates: ${e.message}")
                 }
             }
+
+            activityConfidencePendingIntent?.let { pending ->
+                activityRecognitionClient?.requestActivityUpdates(
+                    TimeUnit.SECONDS.toMillis(5),
+                    pending
+                )?.addOnSuccessListener {
+                    Log.d(TAG, "Activity confidence updates registered with 5s interval")
+                    mainHandler.postDelayed(
+                        relaxActivityUpdatesRunnable,
+                        TimeUnit.MINUTES.toMillis(1)
+                    )
+                }?.addOnFailureListener { e ->
+                    Log.e(TAG, "Failed to register activity updates: ${e.message}")
+                }
+            }
+
+            primeInitialActivityState()
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception in setupActivityRecognition: ${e.message}")
         } catch (e: Exception) {
             Log.e(TAG, "Error in setupActivityRecognition: ${e.message}")
+        }
+    }
+
+    private fun buildPendingIntent(intent: Intent, requestCode: Int): PendingIntent {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.getBroadcast(
+                this,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            )
+        } else {
+            PendingIntent.getBroadcast(
+                this,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
+    }
+
+    private fun primeInitialActivityState() {
+        val stored = ActivityTransitionReceiver.loadLastActivity(this)
+        handleInitialActivityCandidate(stored)
+    }
+
+    private fun handleInitialActivityCandidate(activityType: Int) {
+        ActivityTransitionReceiver.persistLastActivity(this, activityType)
+        runOnUiThread {
+            currentActivityState = ActivityTransitionReceiver.getActivityDisplayName(activityType)
+        }
+        sendBootstrapToService(activityType)
+    }
+
+    private fun sendBootstrapToService(activityType: Int) {
+        val intent = Intent(this, LocationService::class.java).apply {
+            action = LocationService.ACTION_BOOTSTRAP_ACTIVITY
+            putExtra(LocationService.EXTRA_ACTIVITY_TYPE, activityType)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send bootstrap activity to service: ${e.message}")
         }
     }
 
@@ -602,3 +649,6 @@ class MainActivity : ComponentActivity() {
         return ActivityTransitionRequest(transitions)
     }
 }
+
+
+

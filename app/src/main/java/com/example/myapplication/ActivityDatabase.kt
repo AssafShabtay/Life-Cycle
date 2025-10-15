@@ -142,10 +142,10 @@ interface ActivityDao {
     @Query("SELECT * FROM location_tracks WHERE activityId = :activityId ORDER BY timestamp")
     suspend fun getLocationTracksForActivity(activityId: Long): List<LocationTrack>
 
-    @Query("SELECT * FROM still_locations WHERE timestamp BETWEEN :startTime AND :endTime")
+    @Query("SELECT * FROM still_locations WHERE timestamp <= :endTime AND (duration IS NULL OR (timestamp + duration) >= :startTime)")
     suspend fun getStillLocationsBetween(startTime: Date, endTime: Date): List<StillLocation>
 
-    @Query("SELECT * FROM movement_activities WHERE startTime BETWEEN :startTime AND :endTime")
+    @Query("SELECT * FROM movement_activities WHERE startTime < :endTime AND endTime > :startTime")
     suspend fun getMovementActivitiesBetween(startTime: Date, endTime: Date): List<MovementActivity>
 
     @Query("DELETE FROM still_locations WHERE timestamp < :beforeDate")

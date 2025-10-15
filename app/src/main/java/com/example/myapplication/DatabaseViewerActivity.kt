@@ -49,6 +49,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.foundation.layout.heightIn
@@ -57,9 +58,11 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.alpha
 import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DirectionsBike
@@ -75,8 +78,10 @@ import androidx.compose.material.icons.filled.Help
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LocationOn
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+import kotlin.random.Random
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -93,9 +98,12 @@ import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.draw.rotate
@@ -112,6 +120,7 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -145,27 +154,53 @@ data class ActivityTimeSlot(
     val durationMillis: Long,
     var color: Color,
     val latitude: Double? = null,
-    val longitude: Double? = null
+    val longitude: Double? = null,
+    val isActive: Boolean = false,
+    var clusterId: String? = null,
+    val dayStart: Date? = null,
+    val originalStartTime: Date = startTime,
+    val originalEndTime: Date = endTime
 )
 
 private const val ACTIVITY_COLOR_PREFS = "activity_color_preferences"
 
-private fun saveActivityColorPreference(context: Context, activityType: String, color: Color) {
-    context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
-        .edit()
-        .putInt(activityType, color.toArgb())
-        .apply()
+private const val MIN_ACTIVITY_DURATION_MILLIS = 10 * 60 * 1000L
+private const val ACTIVE_SLOT_GRACE_PERIOD_MILLIS = 2 * 60 * 1000L
+private const val LOCATION_COLOR_RADIUS_METERS = 100.0
+private const val LOCATION_PREF_PREFIX = "location:"
+private const val ACTIVITY_PREF_PREFIX = "activity:"
+private const val PIE_REFRESH_INTERVAL_MILLIS = 10 * 60 * 1000L
+
+private fun saveActivityColorPreference(context: Context, slot: ActivityTimeSlot, color: Color) {
+    val preferences = context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
+    val editor = preferences.edit()
+    val locationKey = slot.clusterId?.let { locationPreferenceKey(it) }
+    if (locationKey != null) {
+        editor.putInt(locationKey, color.toArgb())
+    } else {
+        val activityKey = activityPreferenceKey(slot.activityType)
+        editor.putInt(activityKey, color.toArgb())
+        editor.putInt(slot.activityType, color.toArgb())
+    }
+    editor.apply()
 }
 
 private fun applySavedColors(context: Context, slots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
     if (slots.isEmpty()) return slots
     val preferences = context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
     return slots.map { slot ->
-        if (preferences.contains(slot.activityType)) {
-            slot.copy(color = Color(preferences.getInt(slot.activityType, 0).toLong()))
-        } else {
-            slot
+        val locationKey = slot.clusterId?.let { locationPreferenceKey(it) }
+        val activityKey = activityPreferenceKey(slot.activityType)
+        val overrideColor = when {
+            locationKey != null && preferences.contains(locationKey) ->
+                Color(preferences.getInt(locationKey, slot.color.toArgb()).toLong())
+            preferences.contains(activityKey) ->
+                Color(preferences.getInt(activityKey, slot.color.toArgb()).toLong())
+            preferences.contains(slot.activityType) ->
+                Color(preferences.getInt(slot.activityType, slot.color.toArgb()).toLong())
+            else -> null
         }
+        if (overrideColor != null) slot.copy(color = overrideColor) else slot
     }
 }
 
@@ -180,14 +215,17 @@ fun DatabaseViewer(dao: ActivityDao) {
 
     // Load data for pie chart
     LaunchedEffect(selectedDate) {
-        scope.launch {
+        while (true) {
             try {
                 val slots = calculateActivityTimeSlots(dao, selectedDate)
                 activityTimeSlots = applySavedColors(context, slots)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("DatabaseViewer", "Error loading data: ${e.message}")
                 activityTimeSlots = emptyList()
             }
+            delay(PIE_REFRESH_INTERVAL_MILLIS)
         }
     }
 
@@ -207,12 +245,15 @@ fun DatabaseViewer(dao: ActivityDao) {
                 }
             },
             onColorUpdate = { slot, newColor ->
-                saveActivityColorPreference(context, slot.activityType, newColor)
-                activityTimeSlots = activityTimeSlots.map {
-                    if (it.activityType == slot.activityType) {
-                        it.copy(color = newColor)
+                saveActivityColorPreference(context, slot, newColor)
+                val targetClusterId = slot.clusterId
+                activityTimeSlots = activityTimeSlots.map { current ->
+                    val sameCluster = targetClusterId != null && current.clusterId == targetClusterId
+                    val sameActivity = targetClusterId == null && current.activityType == slot.activityType
+                    if (sameCluster || sameActivity) {
+                        current.copy(color = newColor)
                     } else {
-                        it
+                        current
                     }
                 }
             },
@@ -275,6 +316,13 @@ fun DailyActivityPieChartWithNavigation(
             )
         }
 
+        Spacer(modifier = Modifier.height(16.dp))
+
+        ActivityRecordingsList(
+            slots = activityTimeSlots,
+            modifier = Modifier.fillMaxWidth()
+        )
+
         Spacer(modifier = Modifier.height(24.dp))
 
         // Quick Stats
@@ -295,6 +343,7 @@ fun DailyActivityPieChartWithNavigation(
             onColorChange = { newColor ->
                 selectedSlot?.let { slot ->
                     onColorUpdate(slot, newColor)
+                    selectedSlot = slot.copy(color = newColor)
                 }
             }
         )
@@ -515,29 +564,37 @@ fun MiniPieChart(
         )
 
         if (data.isNotEmpty()) {
-            var startAngle = -90f
+            val gapPerSideDegrees = if (data.size > 1) 0.6f else 0f
 
             data.forEach { slot ->
                 val calendar = Calendar.getInstance()
-                calendar.time = slot.startTime
-                val startHour = calendar.get(Calendar.HOUR_OF_DAY)
-                val startMinute = calendar.get(Calendar.MINUTE)
-                val startMinutes = startHour * 60 + startMinute
+                val dayStartMillis = slot.dayStart?.time ?: run {
+                    calendar.time = slot.startTime
+                    calendar.set(Calendar.HOUR_OF_DAY, 0)
+                    calendar.set(Calendar.MINUTE, 0)
+                    calendar.set(Calendar.SECOND, 0)
+                    calendar.set(Calendar.MILLISECOND, 0)
+                    calendar.timeInMillis
+                }
+                val dayEndMillis = dayStartMillis + 24 * 60 * 60 * 1000L
 
-                calendar.time = slot.endTime
-                val endHour = calendar.get(Calendar.HOUR_OF_DAY)
-                val endMinute = calendar.get(Calendar.MINUTE)
-                var endMinutes = endHour * 60 + endMinute
-                if (endMinutes < startMinutes) endMinutes += 24 * 60
+                val clampedStartMillis = slot.startTime.time.coerceIn(dayStartMillis, dayEndMillis)
+                val clampedEndMillis = slot.endTime.time.coerceIn(dayStartMillis, dayEndMillis)
+
+                var startMinutes = ((clampedStartMillis - dayStartMillis).toFloat() / 60000f)
+                var endMinutes = ((clampedEndMillis - dayStartMillis).toFloat() / 60000f)
+                if (endMinutes < startMinutes) endMinutes += 24f * 60f
 
                 val sweepAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
                 val slotStartAngle = (startMinutes / (24f * 60f)) * 360f - 90f
+                val segmentGap = if (gapPerSideDegrees > 0f && sweepAngle > gapPerSideDegrees * 2f) gapPerSideDegrees else 0f
+                val adjustedSweep = (sweepAngle - segmentGap * 2f).coerceAtLeast(0f)
 
-                if (sweepAngle > 0.5f) {
+                if (adjustedSweep > 0.5f) {
                     drawArc(
                         color = slot.color,
-                        startAngle = slotStartAngle,
-                        sweepAngle = sweepAngle,
+                        startAngle = slotStartAngle + segmentGap,
+                        sweepAngle = adjustedSweep,
                         useCenter = true,
                         topLeft = center - Offset(radius, radius),
                         size = Size(radius * 2, radius * 2)
@@ -649,6 +706,22 @@ fun CalendarGrid(
     }
 }
 
+suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<ActivityTimeSlot> = withContext(Dispatchers.IO) {
+    val calendar = Calendar.getInstance().apply {
+        time = date
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+
+    val startOfDay = calendar.time
+    calendar.add(Calendar.DAY_OF_MONTH, 1)
+    val endOfDay = calendar.time
+
+    calculateActivityTimeSlotsForRange(dao, startOfDay, endOfDay)
+}
+
 suspend fun loadMonthActivityData(
     dao: ActivityDao,
     month: Int,
@@ -689,10 +762,13 @@ suspend fun loadMonthActivityData(
 }
 
 suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date, endDate: Date): List<ActivityTimeSlot> {
+    val now = Date()
+    val activeReference = if (!now.before(startDate) && now.before(endDate)) now else null
+
     val stillLocations = dao.getStillLocationsBetween(startDate, endDate)
     val movementActivities = dao.getMovementActivitiesBetween(startDate, endDate)
 
-    val colors = mapOf(
+    val defaultActivityColors = mapOf(
         "Still" to Color(0xFF9E9E9E),
         "Walking" to Color(0xFF4CAF50),
         "Running" to Color(0xFFFF9800),
@@ -706,24 +782,48 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
 
     stillLocations.forEach { location ->
         val activityType = location.wasSupposedToBeActivity ?: "Still"
-        val duration = location.duration ?: 0L
-        val endTime = Date(location.timestamp.time + duration)
+        val recordedDuration = (location.duration ?: 0L).coerceAtLeast(0L)
+        val recordedEndTime = Date(location.timestamp.time + recordedDuration)
+        val isOngoing = activeReference != null && (
+                recordedDuration == 0L ||
+                        kotlin.math.abs(activeReference.time - recordedEndTime.time) <= ACTIVE_SLOT_GRACE_PERIOD_MILLIS
+                )
+        val effectiveDuration = if (isOngoing) {
+            (activeReference!!.time - location.timestamp.time).coerceAtLeast(0L)
+        } else {
+            recordedDuration
+        }
+
+        val rawEndTime = Date(location.timestamp.time + effectiveDuration)
+        val slotStartMillis = max(location.timestamp.time, startDate.time)
+        val slotEndMillis = min(rawEndTime.time, endDate.time)
+        if (slotEndMillis <= slotStartMillis) return@forEach
+
+        val slotStartTime = Date(slotStartMillis)
+        val slotEndTime = Date(slotEndMillis)
+        val clippedDuration = slotEndMillis - slotStartMillis
 
         allSlots.add(
             ActivityTimeSlot(
                 activityType = activityType,
-                startTime = location.timestamp,
-                endTime = endTime,
-                durationMillis = duration,
-                color = colors[activityType] ?: colors.getOrDefault(
+                startTime = slotStartTime,
+                endTime = slotEndTime,
+                durationMillis = clippedDuration,
+                color = defaultActivityColors[activityType] ?: defaultActivityColors.getOrDefault(
                     activityType.substringBefore(" ("),
                     Color(0xFF795548)
                 ),
                 latitude = location.latitude,
-                longitude = location.longitude
+                longitude = location.longitude,
+                isActive = isOngoing,
+                clusterId = null,
+                dayStart = Date(startDate.time),
+                originalStartTime = Date(location.timestamp.time),
+                originalEndTime = rawEndTime
             )
         )
     }
+
 
     movementActivities.forEach { activity ->
         val activityType = if (activity.actuallyMoved) {
@@ -732,24 +832,137 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
             "Still (${activity.activityType})"
         }
 
+        val recordedDuration = (activity.endTime.time - activity.startTime.time).coerceAtLeast(0L)
+        val isOngoing = activeReference != null && (
+                recordedDuration == 0L ||
+                        kotlin.math.abs(activeReference.time - activity.endTime.time) <= ACTIVE_SLOT_GRACE_PERIOD_MILLIS
+                )
+        val effectiveDuration = if (isOngoing) {
+            (activeReference!!.time - activity.startTime.time).coerceAtLeast(0L)
+        } else {
+            recordedDuration
+        }
+
+        val rawEndMillis = activity.startTime.time + effectiveDuration
+        val slotStartMillis = max(activity.startTime.time, startDate.time)
+        val slotEndMillis = min(rawEndMillis, endDate.time)
+        if (slotEndMillis <= slotStartMillis) return@forEach
+
+        val slotStartTime = Date(slotStartMillis)
+        val slotEndTime = Date(slotEndMillis)
+        val clippedDuration = slotEndMillis - slotStartMillis
+
         allSlots.add(
             ActivityTimeSlot(
                 activityType = activityType,
-                startTime = activity.startTime,
-                endTime = activity.endTime,
-                durationMillis = activity.endTime.time - activity.startTime.time,
-                color = colors[activityType] ?: colors.getOrDefault(
+                startTime = slotStartTime,
+                endTime = slotEndTime,
+                durationMillis = clippedDuration,
+                color = defaultActivityColors[activityType] ?: defaultActivityColors.getOrDefault(
                     activityType.substringBefore(" ("),
                     Color(0xFF795548)
                 ),
                 latitude = activity.startLatitude,
-                longitude = activity.startLongitude
+                longitude = activity.startLongitude,
+                isActive = isOngoing,
+                clusterId = null,
+                dayStart = Date(startDate.time),
+                originalStartTime = Date(activity.startTime.time),
+                originalEndTime = Date(rawEndMillis)
             )
         )
     }
 
-    return allSlots.sortedBy { it.startTime }
+
+    val sortedSlots = allSlots.sortedBy { it.startTime }
+    val mergedSlots = mergeAndFilterSlots(sortedSlots)
+    return assignColorsByLocation(mergedSlots, defaultActivityColors)
 }
+private data class LocationCluster(
+    var latitude: Double,
+    var longitude: Double,
+    var count: Int,
+    val id: String,
+    val color: Color
+)
+
+private fun assignColorsByLocation(
+    slots: List<ActivityTimeSlot>,
+    defaultActivityColors: Map<String, Color>
+): List<ActivityTimeSlot> {
+    if (slots.isEmpty()) return slots
+
+    val clusterMap = mutableMapOf<String, LocationCluster>()
+    val clusters = mutableListOf<LocationCluster>()
+
+    return slots.map { slot ->
+        val lat = slot.latitude
+        val lon = slot.longitude
+        if (lat != null && lon != null) {
+            val coarseKey = coarseLocationKey(lat, lon)
+            val existingByKey = clusterMap[coarseKey]
+            val cluster = existingByKey ?: clusters.firstOrNull {
+                distanceMeters(it.latitude, it.longitude, lat, lon) <= LOCATION_COLOR_RADIUS_METERS
+            }
+            val finalCluster = if (cluster != null) {
+                clusterMap[coarseKey] = cluster
+                val newCount = cluster.count + 1
+                cluster.latitude = (cluster.latitude * cluster.count + lat) / newCount
+                cluster.longitude = (cluster.longitude * cluster.count + lon) / newCount
+                cluster.count = newCount
+                cluster
+            } else {
+                val id = coarseKey
+                val color = generateColorForKey(id)
+                val newCluster = LocationCluster(
+                    latitude = lat,
+                    longitude = lon,
+                    count = 1,
+                    id = id,
+                    color = color
+                )
+                clusters.add(newCluster)
+                clusterMap[coarseKey] = newCluster
+                newCluster
+            }
+            slot.copy(color = finalCluster.color, clusterId = finalCluster.id)
+        } else {
+            val fallbackColor = defaultActivityColors[slot.activityType]
+                ?: defaultActivityColors["Still"]
+                ?: Color(0xFF9E9E9E)
+            slot.copy(clusterId = null, color = fallbackColor)
+        }
+    }
+}
+
+private fun coarseLocationKey(lat: Double, lon: Double): String {
+    val latBucket = (lat * 1000).roundToInt()
+    val lonBucket = (lon * 1000).roundToInt()
+    return latBucket.toString() + "_" + lonBucket.toString()
+}
+
+private fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val earthRadius = 6371000.0
+    val dLat = Math.toRadians(lat2 - lat1)
+    val dLon = Math.toRadians(lon2 - lon1)
+    val sinLat = kotlin.math.sin(dLat / 2)
+    val sinLon = kotlin.math.sin(dLon / 2)
+    val a = sinLat * sinLat + kotlin.math.cos(Math.toRadians(lat1)) *
+            kotlin.math.cos(Math.toRadians(lat2)) * sinLon * sinLon
+    val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
+    return earthRadius * c
+}
+
+private fun generateColorForKey(key: String): Color {
+    val random = Random(key.hashCode())
+    val hue = random.nextFloat() * 360f
+    val saturation = 0.55f + random.nextFloat() * 0.35f
+    val value = 0.75f + random.nextFloat() * 0.25f
+    return Color.hsv(hue, saturation, value)
+}
+
+private fun locationPreferenceKey(clusterId: String): String = LOCATION_PREF_PREFIX + clusterId
+private fun activityPreferenceKey(activityType: String): String = ACTIVITY_PREF_PREFIX + activityType
 
 @Composable
 fun AnimatedPieChart(
@@ -778,7 +991,20 @@ fun AnimatedPieChart(
         val sweepAngle: Float
     )
 
+    data class SegmentIconInfo(
+        val slot: ActivityTimeSlot,
+        val center: Offset,
+        val alpha: Float,
+        val sizeDp: Dp,
+        val sizePx: Float
+    )
+
     val segmentBounds = remember { mutableStateListOf<SegmentBounds>() }
+    val segmentIcons = remember { mutableStateListOf<SegmentIconInfo>() }
+
+    val iconSize = 20.dp
+    val density = LocalDensity.current
+    val iconSizePx = with(density) { iconSize.toPx() }
 
     LaunchedEffect(data) {
         animationProgress = 0f
@@ -799,7 +1025,7 @@ fun AnimatedPieChart(
         if (luminance > 0.5) android.graphics.Color.BLACK else android.graphics.Color.WHITE
     }
 
-    Canvas(
+    Box(
         modifier = modifier.pointerInput(data) {
             detectTapGestures { offset ->
                 val centerX = size.width / 2f
@@ -839,232 +1065,358 @@ fun AnimatedPieChart(
             }
         }
     ) {
-        val canvasSize = size.minDimension
-        val radius = canvasSize / 2f * 0.85f
-        val innerRadius = radius * 0.55f
-        val center = Offset(size.width / 2f, size.height / 2f)
+        Canvas(modifier = Modifier.matchParentSize()) {
+            val canvasSize = size.minDimension
+            val radius = canvasSize / 2f * 0.85f
+            val innerRadius = radius * 0.55f
+            val center = Offset(size.width / 2f, size.height / 2f)
 
-        segmentBounds.clear()
+            segmentBounds.clear()
+            segmentIcons.clear()
 
-        val totalMinutes = data.sumOf { it.durationMillis } / (1000 * 60)
-        val totalHours = totalMinutes / 60
-        val remainingMinutes = totalMinutes % 60
+            val totalMinutes = if (data.isEmpty()) 0L else data.sumOf { it.durationMillis } / (1000 * 60)
+            val totalHours = totalMinutes / 60
+            val remainingMinutes = totalMinutes % 60
 
-        val strokeWidth = radius - innerRadius
-        val middleRadius = (radius + innerRadius) / 2f
-        val minDisplayAngle = 8f
+            val strokeWidth = radius - innerRadius
+            val middleRadius = (radius + innerRadius) / 2f
 
-        data class VisualSegment(
-            val slot: ActivityTimeSlot,
-            val startAngle: Float,
-            val sweepAngle: Float,
-            val displayAngle: Float
-        )
+            val millisPerDay = 24 * 60 * 60 * 1000L
+            val minRenderableAngle = 0.5f
+            val minAngleForIcon = 10f
+            val minAngleGeneral = 4f
+            val iconDisplayThreshold = 7.5f
+            val gapDetectionThreshold = 60 * 1000L
 
-        val visualSegments = mutableListOf<VisualSegment>()
-        var accumulatedAngle = 0f
+            data class BaseSegment(
+                val slot: ActivityTimeSlot,
+                val startAngle: Float,
+                val baseAngle: Float
+            )
 
-        data.forEach { slot ->
+            data class VisualSegment(
+                val slot: ActivityTimeSlot,
+                val startAngle: Float,
+                val displayAngle: Float,
+                val originalAngle: Float
+            )
+
             val calendar = Calendar.getInstance()
-            calendar.time = slot.startTime
-            val startHour = calendar.get(Calendar.HOUR_OF_DAY)
-            val startMinute = calendar.get(Calendar.MINUTE)
-            val startMinutes = startHour * 60 + startMinute
+            val baseSegments = data
+                .sortedBy { it.startTime }
+                .mapNotNull { slot ->
+                    val dayStartMillis = slot.dayStart?.time ?: run {
+                        calendar.time = slot.startTime
+                        calendar.set(Calendar.HOUR_OF_DAY, 0)
+                        calendar.set(Calendar.MINUTE, 0)
+                        calendar.set(Calendar.SECOND, 0)
+                        calendar.set(Calendar.MILLISECOND, 0)
+                        calendar.timeInMillis
+                    }
+                    val dayEndMillis = dayStartMillis + millisPerDay
 
-            calendar.time = slot.endTime
-            val endHour = calendar.get(Calendar.HOUR_OF_DAY)
-            val endMinute = calendar.get(Calendar.MINUTE)
-            var endMinutes = endHour * 60 + endMinute
-            if (endMinutes < startMinutes) endMinutes += 24 * 60
+                    val clampedStartMillis = slot.startTime.time.coerceIn(dayStartMillis, dayEndMillis)
+                    val clampedEndMillis = slot.endTime.time.coerceIn(dayStartMillis, dayEndMillis)
 
-            val sweepAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
-            val startAngle = (startMinutes / (24f * 60f)) * 360f - 90f
+                    var startMinutes = ((clampedStartMillis - dayStartMillis).toFloat() / 60000f)
+                    var endMinutes = ((clampedEndMillis - dayStartMillis).toFloat() / 60000f)
+                    if (endMinutes < startMinutes) endMinutes += 24f * 60f
 
-            if (sweepAngle > 0.5f) {
-                val displayAngle = if (slot.durationMillis >= 15 * 60 * 1000 && sweepAngle < minDisplayAngle) {
-                    minDisplayAngle
-                } else {
-                    sweepAngle
+                    val rawAngle = ((endMinutes - startMinutes) / (24f * 60f)) * 360f
+                    val normalizedAngle = when {
+                        slot.isActive -> max(rawAngle, minAngleGeneral)
+                        else -> rawAngle
+                    }
+                    if (normalizedAngle < minRenderableAngle && !slot.isActive) {
+                        null
+                    } else {
+                        val startAngle = (startMinutes / (24f * 60f)) * 360f - 90f
+                        BaseSegment(slot, startAngle, normalizedAngle)
+                    }
                 }
 
-                visualSegments.add(
-                    VisualSegment(slot, startAngle, sweepAngle, displayAngle)
-                )
-                accumulatedAngle += displayAngle
-            }
-        }
+            val visualSegments = mutableListOf<VisualSegment>()
+            if (baseSegments.isNotEmpty()) {
+                val boostedSegments = MutableList(baseSegments.size) { false }
+                val targetAngles = MutableList(baseSegments.size) { index ->
+                    val slot = baseSegments[index].slot
+                    val baseAngle = baseSegments[index].baseAngle
+                    if (slot.durationMillis >= 15 * 60 * 1000L && baseAngle < minAngleForIcon) {
+                        boostedSegments[index] = true
+                        minAngleForIcon
+                    } else {
+                        baseAngle
+                    }
+                }
 
-        if (accumulatedAngle > 360f && visualSegments.isNotEmpty()) {
-            val scale = 360f / accumulatedAngle
-            visualSegments.replaceAll { it.copy(displayAngle = it.displayAngle * scale) }
-        }
+                var totalAngle = targetAngles.sum()
+                if (totalAngle > 360f) {
+                    var excess = totalAngle - 360f
 
-        visualSegments.forEach { segment ->
-            val animatedSweep = segment.sweepAngle * animationProgress
-
-            if (animatedSweep > 0.5f) {
-                val gapSize = if (animatedSweep > 2f) 0.5f else 0f
-
-                drawArc(
-                    color = segment.slot.color,
-                    startAngle = segment.startAngle + gapSize,
-                    sweepAngle = animatedSweep - (gapSize * 2),
-                    useCenter = false,
-                    topLeft = center - Offset(middleRadius, middleRadius),
-                    size = Size(middleRadius * 2, middleRadius * 2),
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(
-                        width = strokeWidth,
-                        cap = androidx.compose.ui.graphics.StrokeCap.Butt
-                    )
-                )
-
-                segmentBounds.add(
-                    SegmentBounds(
-                        slot = segment.slot,
-                        startAngle = segment.startAngle + 90,
-                        sweepAngle = segment.sweepAngle
-                    )
-                )
-
-                if (segment.slot.durationMillis >= 15 * 60 * 1000 &&
-                    animationProgress > 0.8f &&
-                    segment.sweepAngle >= 6f) {
-
-                    val midAngle = segment.startAngle + (segment.sweepAngle / 2f)
-                    val midAngleRad = Math.toRadians(midAngle.toDouble())
-
-                    val textX = center.x + (middleRadius * cos(midAngleRad)).toFloat()
-                    val textY = center.y + (middleRadius * sin(midAngleRad)).toFloat()
-
-                    val durationMinutes = segment.slot.durationMillis / (1000 * 60)
-                    val durationText = when {
-                        durationMinutes >= 60 -> "${durationMinutes / 60}h${if (durationMinutes % 60 > 0) "${durationMinutes % 60}m" else ""}"
-                        else -> "${durationMinutes}m"
+                    fun reduce(indices: List<Int>, floor: Float) {
+                        if (indices.isEmpty() || excess <= 0f) return
+                        var available = 0f
+                        indices.forEach { idx ->
+                            available += (targetAngles[idx] - floor).coerceAtLeast(0f)
+                        }
+                        if (available <= 0f) return
+                        val reduction = excess.coerceAtMost(available)
+                        indices.forEach { idx ->
+                            val adjustable = (targetAngles[idx] - floor).coerceAtLeast(0f)
+                            if (adjustable > 0f) {
+                                val share = (adjustable / available) * reduction
+                                targetAngles[idx] -= share
+                            }
+                        }
+                        excess -= reduction
                     }
 
-                    drawContext.canvas.nativeCanvas.drawText(
-                        durationText,
-                        textX,
-                        textY + 6,
-                        textPaint
+                    val adjustable = baseSegments.indices.filter { !boostedSegments[it] && targetAngles[it] > minAngleGeneral }
+                    reduce(adjustable, minAngleGeneral)
+
+                    val allCandidates = baseSegments.indices.filter { targetAngles[it] > minAngleGeneral }
+                    reduce(allCandidates, minAngleGeneral)
+
+                    val boosted = baseSegments.indices.filter { boostedSegments[it] && targetAngles[it] > minAngleForIcon }
+                    reduce(boosted, minAngleForIcon)
+                }
+
+                var currentAngle = baseSegments.first().startAngle
+                baseSegments.indices.forEach { index ->
+                    val base = baseSegments[index]
+                    if (index > 0) {
+                        val desired = base.startAngle
+                        if (desired > currentAngle) {
+                            currentAngle = desired
+                        }
+                    }
+                    val displayAngle = targetAngles[index]
+                    visualSegments.add(
+                        VisualSegment(
+                            slot = base.slot,
+                            startAngle = currentAngle,
+                            displayAngle = displayAngle,
+                            originalAngle = base.baseAngle
+                        )
                     )
+                    currentAngle += displayAngle
                 }
             }
-        }
 
-        // Center text
-        val centerTextPaint = android.graphics.Paint().apply {
-            textSize = 42f
-            color = textColor
-            textAlign = android.graphics.Paint.Align.CENTER
-            typeface = android.graphics.Typeface.create(
-                android.graphics.Typeface.DEFAULT,
-                android.graphics.Typeface.BOLD
-            )
-            isAntiAlias = true
-        }
+            var angleRemaining = 360f * animationProgress
+            val gapPerSideDegrees = if (visualSegments.size > 1) 0.6f else 0f
+            visualSegments.forEach { segment ->
+                val segmentDisplay = segment.displayAngle
+                val visibleFraction = when {
+                    angleRemaining <= 0f -> 0f
+                    angleRemaining >= segmentDisplay -> 1f
+                    segmentDisplay > 0f -> angleRemaining / segmentDisplay
+                    else -> 0f
+                }
+                angleRemaining = (angleRemaining - segmentDisplay).coerceAtLeast(0f)
 
-        drawContext.canvas.nativeCanvas.drawText(
-            if (totalHours > 0 || remainingMinutes > 0) {
-                "${totalHours}h ${remainingMinutes}m"
-            } else {
-                "No data"
-            },
-            center.x,
-            center.y - 5,
-            centerTextPaint
-        )
+                val animatedSweep = segment.displayAngle * visibleFraction
+                val targetGap = if (gapPerSideDegrees > 0f && segment.displayAngle > gapPerSideDegrees * 2f) gapPerSideDegrees else 0f
+                val animatedGap = if (targetGap > 0f && animatedSweep > targetGap * 2f) targetGap else 0f
+                val trimmedSweep = (animatedSweep - animatedGap * 2f).coerceAtLeast(0f)
 
-        drawContext.canvas.nativeCanvas.drawText(
-            "tracked",
-            center.x,
-            center.y + 30,
-            android.graphics.Paint().apply {
-                textSize = 24f
+                if (trimmedSweep > 0.5f) {
+                    val arcStartAngle = segment.startAngle + animatedGap
+
+                    drawArc(
+                        color = segment.slot.color,
+                        startAngle = arcStartAngle,
+                        sweepAngle = trimmedSweep,
+                        useCenter = false,
+                        topLeft = center - Offset(middleRadius, middleRadius),
+                        size = Size(middleRadius * 2, middleRadius * 2),
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(
+                            width = strokeWidth,
+                            cap = androidx.compose.ui.graphics.StrokeCap.Butt
+                        )
+                    )
+
+                    val detectionGap = targetGap
+                    val trimmedDisplayAngle = (segment.displayAngle - detectionGap * 2f).coerceAtLeast(0f)
+                    if (trimmedDisplayAngle > 0f) {
+                        segmentBounds.add(
+                            SegmentBounds(
+                                slot = segment.slot,
+                                startAngle = segment.startAngle + 90 + detectionGap,
+                                sweepAngle = trimmedDisplayAngle
+                            )
+                        )
+                    }
+
+                    if (
+                        segment.slot.durationMillis >= 15 * 60 * 1000 &&
+                        visibleFraction > 0.9f &&
+                        trimmedDisplayAngle >= iconDisplayThreshold
+                    ) {
+                        val midAngle = segment.startAngle + detectionGap + (trimmedDisplayAngle / 2f)
+                        val midAngleRad = Math.toRadians(midAngle.toDouble())
+
+                        val textRadiusForSegment = innerRadius + strokeWidth * 0.45f
+                        val iconRadiusPreferred = innerRadius + strokeWidth * 0.75f
+                        val angleRad = Math.toRadians(trimmedDisplayAngle.toDouble())
+                        val halfAngleSin = sin(angleRad / 2.0).toFloat()
+                        val chordText = 2f * textRadiusForSegment * halfAngleSin
+                        val chordIcon = 2f * iconRadiusPreferred * halfAngleSin
+
+                        val dayStartMillisForSlot = segment.slot.dayStart?.time ?: run {
+                            calendar.time = segment.slot.startTime
+                            calendar.set(Calendar.HOUR_OF_DAY, 0)
+                            calendar.set(Calendar.MINUTE, 0)
+                            calendar.set(Calendar.SECOND, 0)
+                            calendar.set(Calendar.MILLISECOND, 0)
+                            calendar.timeInMillis
+                        }
+                        val totalDurationCandidate = segment.slot.originalEndTime.time - segment.slot.originalStartTime.time
+                        val totalDurationMillis = max(segment.slot.durationMillis, max(totalDurationCandidate, 0L))
+                        val durationMillisForLabel = if (segment.slot.originalStartTime.time < dayStartMillisForSlot) {
+                            totalDurationMillis
+                        } else {
+                            segment.slot.durationMillis
+                        }
+                        val durationMinutes = durationMillisForLabel / (1000 * 60)
+                        val durationText = when {
+                            durationMinutes >= 60 -> "${durationMinutes / 60}h${if (durationMinutes % 60 > 0) "${durationMinutes % 60}m" else ""}"
+                            else -> "${durationMinutes}m"
+                        }
+
+                        val textPaintSegment = android.graphics.Paint(textPaint)
+                        var textWidth = textPaintSegment.measureText(durationText)
+                        val maxTextWidth = (chordText - 10f).coerceAtLeast(0f)
+                        if (maxTextWidth > 0f && textWidth > maxTextWidth) {
+                            val scale = (maxTextWidth / textWidth).coerceIn(0.5f, 1f)
+                            textPaintSegment.textSize *= scale
+                            textWidth = textPaintSegment.measureText(durationText)
+                        }
+                        val metrics = textPaintSegment.fontMetrics
+                        val textYOffset = (metrics.ascent + metrics.descent) / 2f
+                        val minTextRadius = innerRadius + textPaintSegment.textSize
+                        val maxTextRadius = radius - textPaintSegment.textSize
+
+                        if (maxTextWidth > 0f && textWidth <= chordText + 1f && minTextRadius < maxTextRadius) {
+                            val safeTextRadius = textRadiusForSegment.coerceIn(minTextRadius, maxTextRadius)
+                            val textX = center.x + (safeTextRadius * cos(midAngleRad)).toFloat()
+                            val textY = center.y + (safeTextRadius * sin(midAngleRad)).toFloat() - textYOffset
+                            drawContext.canvas.nativeCanvas.drawText(
+                                durationText,
+                                textX,
+                                textY,
+                                textPaintSegment
+                            )
+                        }
+
+                        val iconAlpha = ((animationProgress - 0.6f) / 0.4f).coerceIn(0f, 1f)
+                        val availableIcon = chordIcon - 8f
+                        if (iconAlpha > 0f && visibleFraction > 0.9f && availableIcon > 4f) {
+                            var iconSizePxAdjusted = iconSizePx.coerceAtMost(availableIcon)
+                            val minIconPx = iconSizePx * 0.4f
+                            if (iconSizePxAdjusted < minIconPx) {
+                                iconSizePxAdjusted = if (availableIcon <= minIconPx) availableIcon else minIconPx
+                            }
+
+                            val maxIconRadius = radius - iconSizePxAdjusted / 2f
+                            val minIconRadius = innerRadius + iconSizePxAdjusted / 2f
+                            val iconRadius = iconRadiusPreferred.coerceIn(minIconRadius, maxIconRadius)
+
+                            val iconX = center.x + (iconRadius * cos(midAngleRad)).toFloat()
+                            val iconY = center.y + (iconRadius * sin(midAngleRad)).toFloat()
+                            val iconSizeDpAdjusted = with(density) { iconSizePxAdjusted.toDp() }
+
+                            segmentIcons.add(
+                                SegmentIconInfo(
+                                    slot = segment.slot,
+                                    center = Offset(iconX, iconY),
+                                    alpha = iconAlpha,
+                                    sizeDp = iconSizeDpAdjusted,
+                                    sizePx = iconSizePxAdjusted
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+
+            val centerTextPaint = android.graphics.Paint().apply {
+                textSize = 42f
                 color = textColor
                 textAlign = android.graphics.Paint.Align.CENTER
+                typeface = android.graphics.Typeface.create(
+                    android.graphics.Typeface.DEFAULT,
+                    android.graphics.Typeface.BOLD
+                )
                 isAntiAlias = true
             }
-        )
+
+            drawContext.canvas.nativeCanvas.drawText(
+                if (totalHours > 0 || remainingMinutes > 0) {
+                    "${totalHours}h ${remainingMinutes}m"
+                } else {
+                    "No data"
+                },
+                center.x,
+                center.y - 5,
+                centerTextPaint
+            )
+
+            drawContext.canvas.nativeCanvas.drawText(
+                "tracked",
+                center.x,
+                center.y + 30,
+                android.graphics.Paint().apply {
+                    textSize = 24f
+                    color = textColor
+                    textAlign = android.graphics.Paint.Align.CENTER
+                    isAntiAlias = true
+                }
+            )
+        }
+
+        segmentIcons.forEach { iconInfo ->
+            val iconVector = getIconVectorForActivity(iconInfo.slot.activityType)
+
+            Icon(
+                imageVector = iconVector,
+                contentDescription = iconInfo.slot.activityType,
+                modifier = Modifier
+                    .size(iconInfo.sizeDp)
+                    .offset {
+                        IntOffset(
+                            (iconInfo.center.x - iconInfo.sizePx / 2f).roundToInt(),
+                            (iconInfo.center.y - iconInfo.sizePx / 2f).roundToInt()
+                        )
+                    }
+                    .alpha(iconInfo.alpha),
+                tint = Color.White
+            )
+        }
     }
 }
 
-suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<ActivityTimeSlot> {
-    val calendar = Calendar.getInstance()
-    calendar.time = date
-    calendar.set(Calendar.HOUR_OF_DAY, 0)
-    calendar.set(Calendar.MINUTE, 0)
-    calendar.set(Calendar.SECOND, 0)
-    calendar.set(Calendar.MILLISECOND, 0)
-    val startOfDay = calendar.time
 
-    calendar.add(Calendar.DAY_OF_MONTH, 1)
-    val endOfDay = calendar.time
-
-    val stillLocations = dao.getStillLocationsBetween(startOfDay, endOfDay)
-    val movementActivities = dao.getMovementActivitiesBetween(startOfDay, endOfDay)
-
-    val colors = mapOf(
-        "Still" to Color(0xFF9E9E9E),
-        "Walking" to Color(0xFF4CAF50),
-        "Running" to Color(0xFFFF9800),
-        "Driving" to Color(0xFF2196F3),
-        "Cycling" to Color(0xFF9C27B0),
-        "On Foot" to Color(0xFF8BC34A),
-        "Unknown" to Color(0xFF607D8B)
-    )
-
-    val allSlots = mutableListOf<ActivityTimeSlot>()
-
-    stillLocations.forEach { location ->
-        val activityType = location.wasSupposedToBeActivity ?: "Still"
-        val duration = location.duration ?: 0L
-        val endTime = Date(location.timestamp.time + duration)
-
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = location.timestamp,
-                endTime = endTime,
-                durationMillis = duration,
-                color = colors[activityType] ?: colors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                ),
-                latitude = location.latitude,
-                longitude = location.longitude
-            )
-        )
+fun getIconVectorForActivity(activityType: String): ImageVector {
+    val normalized = activityType.substringBefore(" (")
+    return when (normalized) {
+        "Still" -> Icons.Default.Home
+        "Walking" -> Icons.AutoMirrored.Filled.DirectionsWalk
+        "Running" -> Icons.AutoMirrored.Filled.DirectionsRun
+        "Driving" -> Icons.Default.DirectionsCar
+        "Cycling" -> Icons.AutoMirrored.Filled.DirectionsBike
+        "On Foot" -> Icons.AutoMirrored.Filled.DirectionsWalk
+        "Unknown" -> Icons.AutoMirrored.Filled.Help
+        else -> Icons.Default.Place
     }
+}
 
-    movementActivities.forEach { activity ->
-        val activityType = if (activity.actuallyMoved) {
-            activity.activityType
-        } else {
-            "Still (${activity.activityType})"
-        }
 
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = activity.startTime,
-                endTime = activity.endTime,
-                durationMillis = activity.endTime.time - activity.startTime.time,
-                color = colors[activityType] ?: colors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                ),
-                latitude = activity.startLatitude,
-                longitude = activity.startLongitude
-            )
-        )
-    }
-
-    val sortedSlots = allSlots.sortedBy { it.startTime }
-
+private fun mergeAndFilterSlots(sortedSlots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
     val mergedSlots = mutableListOf<ActivityTimeSlot>()
-    sortedSlots.forEach { slot ->
-        if (slot.durationMillis < 30000) return@forEach
+    for (slot in sortedSlots) {
+        if (slot.durationMillis < 30000 && !slot.isActive) continue
 
         val lastSlot = mergedSlots.lastOrNull()
         if (lastSlot != null) {
@@ -1073,7 +1425,9 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                     val newEndTime = if (slot.endTime.after(lastSlot.endTime)) slot.endTime else lastSlot.endTime
                     mergedSlots[mergedSlots.size - 1] = lastSlot.copy(
                         endTime = newEndTime,
-                        durationMillis = newEndTime.time - lastSlot.startTime.time
+                        durationMillis = newEndTime.time - lastSlot.startTime.time,
+                        isActive = lastSlot.isActive || slot.isActive,
+                        originalEndTime = if (slot.originalEndTime.after(lastSlot.originalEndTime)) slot.originalEndTime else lastSlot.originalEndTime
                     )
                 } else if (slot.endTime.time - slot.startTime.time > 60000) {
                     val adjustedStartTime = lastSlot.endTime
@@ -1081,7 +1435,8 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
                         mergedSlots.add(
                             slot.copy(
                                 startTime = adjustedStartTime,
-                                durationMillis = slot.endTime.time - adjustedStartTime.time
+                                durationMillis = slot.endTime.time - adjustedStartTime.time,
+                                isActive = slot.isActive
                             )
                         )
                     }
@@ -1098,7 +1453,216 @@ suspend fun calculateActivityTimeSlots(dao: ActivityDao, date: Date): List<Activ
         }
     }
 
-    return mergedSlots
+    val filteredSlots = mutableListOf<ActivityTimeSlot>()
+    for (slot in mergedSlots) {
+        val duration = slot.durationMillis
+        if (duration < MIN_ACTIVITY_DURATION_MILLIS && !slot.isActive) {
+            val isStationaryWalking = slot.activityType.startsWith("Still (", ignoreCase = true) &&
+                    slot.activityType.contains("Walking", ignoreCase = true)
+            val lastIndex = filteredSlots.lastIndex
+            if (isStationaryWalking && lastIndex >= 0) {
+                val lastSlot = filteredSlots[lastIndex]
+                if (lastSlot.activityType == "Still") {
+                    val extendedEndTime = if (slot.endTime.after(lastSlot.endTime)) slot.endTime else lastSlot.endTime
+                    filteredSlots[lastIndex] = lastSlot.copy(
+                        endTime = extendedEndTime,
+                        durationMillis = extendedEndTime.time - lastSlot.startTime.time,
+                        isActive = lastSlot.isActive || slot.isActive,
+                        originalEndTime = if (slot.originalEndTime.after(lastSlot.originalEndTime)) slot.originalEndTime else lastSlot.originalEndTime
+                    )
+                }
+            }
+            continue
+        }
+        filteredSlots.add(slot)
+    }
+
+    val walkMergedSlots = mutableListOf<ActivityTimeSlot>()
+    var index = 0
+    while (index < filteredSlots.size) {
+        val slot = filteredSlots[index]
+
+        if (!slot.activityType.equals("Walking", ignoreCase = true)) {
+            walkMergedSlots.add(slot)
+            index += 1
+            continue
+        }
+
+        var mergedEndTime = slot.endTime
+        var mergedOriginalEndTime = slot.originalEndTime
+        var mergedIsActive = slot.isActive
+        var consumedIndex = index
+        var nextIndex = index + 1
+
+        while (nextIndex < filteredSlots.size) {
+            val candidate = filteredSlots[nextIndex]
+
+            if (candidate.activityType.equals("Walking", ignoreCase = true)) {
+                val gapMillis = candidate.startTime.time - mergedEndTime.time
+                if (gapMillis <= MIN_ACTIVITY_DURATION_MILLIS) {
+                    if (candidate.endTime.after(mergedEndTime)) {
+                        mergedEndTime = candidate.endTime
+                    }
+                    if (candidate.originalEndTime.after(mergedOriginalEndTime)) {
+                        mergedOriginalEndTime = candidate.originalEndTime
+                    }
+                    mergedIsActive = mergedIsActive || candidate.isActive
+                    consumedIndex = nextIndex
+                    nextIndex += 1
+                    continue
+                }
+                break
+            }
+
+            var lookahead = nextIndex
+            var accumulatedStopDuration = 0L
+            while (lookahead < filteredSlots.size && !filteredSlots[lookahead].activityType.equals("Walking", ignoreCase = true)) {
+                val stopSlot = filteredSlots[lookahead]
+                val stopDuration = stopSlot.durationMillis
+                if (stopDuration > MIN_ACTIVITY_DURATION_MILLIS) {
+                    accumulatedStopDuration = MIN_ACTIVITY_DURATION_MILLIS + 1
+                    break
+                }
+                accumulatedStopDuration += stopDuration
+                if (accumulatedStopDuration > MIN_ACTIVITY_DURATION_MILLIS) {
+                    break
+                }
+                lookahead += 1
+            }
+
+            if (accumulatedStopDuration <= MIN_ACTIVITY_DURATION_MILLIS &&
+                lookahead < filteredSlots.size &&
+                filteredSlots[lookahead].activityType.equals("Walking", ignoreCase = true)
+            ) {
+                val nextWalking = filteredSlots[lookahead]
+                val gapMillis = nextWalking.startTime.time - mergedEndTime.time
+                if (gapMillis <= MIN_ACTIVITY_DURATION_MILLIS) {
+                    if (nextWalking.endTime.after(mergedEndTime)) {
+                        mergedEndTime = nextWalking.endTime
+                    }
+                    if (nextWalking.originalEndTime.after(mergedOriginalEndTime)) {
+                        mergedOriginalEndTime = nextWalking.originalEndTime
+                    }
+                    mergedIsActive = mergedIsActive || nextWalking.isActive
+                    consumedIndex = lookahead
+                    nextIndex = lookahead + 1
+                    continue
+                }
+            }
+
+            break
+        }
+
+        val mergedSlot = slot.copy(
+            endTime = mergedEndTime,
+            durationMillis = mergedEndTime.time - slot.startTime.time,
+            isActive = mergedIsActive,
+            originalEndTime = mergedOriginalEndTime
+        )
+        walkMergedSlots.add(mergedSlot)
+        index = consumedIndex + 1
+    }
+
+    return walkMergedSlots
+}
+
+@Composable
+fun ActivityRecordingsList(
+    slots: List<ActivityTimeSlot>,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "Activity Records",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+
+            if (slots.isEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "No recordings for this day.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                val timeFormatter = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                slots.forEachIndexed { index, slot ->
+                    ActivityRecordingRow(slot = slot, timeFormatter = timeFormatter)
+
+                    if (index < slots.lastIndex) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ActivityRecordingRow(
+    slot: ActivityTimeSlot,
+    timeFormatter: SimpleDateFormat,
+    modifier: Modifier = Modifier
+) {
+    val timeRange = "${timeFormatter.format(slot.startTime)} - ${timeFormatter.format(slot.endTime)}"
+    val durationText = formatDuration(slot.durationMillis)
+    val locationText = if (slot.latitude != null && slot.longitude != null) {
+        String.format(Locale.getDefault(), "%.4f, %.4f", slot.latitude, slot.longitude)
+    } else {
+        "Location unavailable"
+    }
+
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(14.dp)
+                .clip(CircleShape)
+                .background(slot.color)
+        )
+
+        Spacer(modifier = Modifier.width(12.dp))
+
+        val activityTitle = if (slot.isActive) "${slot.activityType} (recording)" else slot.activityType
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = activityTitle,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = timeRange,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "Duration: $durationText",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "Location: $locationText",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
 }
 
 @Composable
@@ -1287,10 +1851,10 @@ fun LocationSlotPopover(
                         modifier = Modifier.fillMaxSize(),
                         cameraPositionState = cameraPositionState,
                         uiSettings = MapUiSettings(
-                            zoomControlsEnabled = false,
-                            myLocationButtonEnabled = false,
+                            zoomControlsEnabled = true,
+                            myLocationButtonEnabled = true,
                             scrollGesturesEnabled = false,
-                            zoomGesturesEnabled = false,
+                            zoomGesturesEnabled = true,
                             tiltGesturesEnabled = false,
                         )
                     ) {
@@ -1499,3 +2063,4 @@ fun formatDuration(milliseconds: Long): String {
         else -> "${seconds}s"
     }
 }
+

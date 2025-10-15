@@ -64,6 +64,7 @@ class LocationService : Service() {
         const val ACTION_ACTIVITY_UPDATE_UI = "com.example.myapplication.ACTIVITY_UPDATE_UI"
         const val EXTRA_ACTIVITY_TYPE = "activity_type"
         const val EXTRA_TRANSITION_TYPE = "transition_type"
+        const val ACTION_BOOTSTRAP_ACTIVITY = "com.example.myapplication.BOOTSTRAP_ACTIVITY"
         // Activity types that involve movement
         val MOVEMENT_ACTIVITIES = setOf(
             DetectedActivity.IN_VEHICLE,
@@ -85,18 +86,29 @@ class LocationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ActivityTransitionReceiver.ACTION_ACTIVITY_UPDATE) {
-            val activityType = intent.getIntExtra(
-                ActivityTransitionReceiver.EXTRA_ACTIVITY_TYPE,
-                DetectedActivity.UNKNOWN
-            )
-            val transitionType = intent.getIntExtra(
-                ActivityTransitionReceiver.EXTRA_TRANSITION_TYPE,
-                ActivityTransition.ACTIVITY_TRANSITION_EXIT
-            )
+        when (intent?.action) {
+            ActivityTransitionReceiver.ACTION_ACTIVITY_UPDATE -> {
+                val activityType = intent.getIntExtra(
+                    ActivityTransitionReceiver.EXTRA_ACTIVITY_TYPE,
+                    DetectedActivity.UNKNOWN
+                )
+                val transitionType = intent.getIntExtra(
+                    ActivityTransitionReceiver.EXTRA_TRANSITION_TYPE,
+                    ActivityTransition.ACTIVITY_TRANSITION_EXIT
+                )
 
-            handleActivityUpdate(activityType, transitionType)
-            return START_STICKY
+                handleActivityUpdate(activityType, transitionType)
+                return START_STICKY
+            }
+
+            ACTION_BOOTSTRAP_ACTIVITY -> {
+                val activityType = intent.getIntExtra(
+                    ActivityTransitionReceiver.EXTRA_ACTIVITY_TYPE,
+                    DetectedActivity.UNKNOWN
+                )
+                bootstrapActivity(activityType)
+                return START_STICKY
+            }
         }
 
         createNotificationChannel()
@@ -197,43 +209,120 @@ class LocationService : Service() {
     }
 
     private fun handleActivityUpdate(activityType: Int, transitionType: Int) {
+        val normalizedActivityType = normalizeActivityType(activityType)
         val previousActivity = currentActivity
-        val wasInActivity = isInActivity
+        val enteringActivity = transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
 
-        currentActivity = activityType
-        isInActivity = (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER)
+        if (enteringActivity) {
+            if (!shouldAcceptEntry(normalizedActivityType)) {
+                Log.d(TAG, "Ignoring ${getActivityName(normalizedActivityType)} enter; speed/movement check failed")
+                return
+            }
+        } else if (normalizedActivityType != previousActivity) {
+            Log.d(TAG, "Ignoring exit for ${getActivityName(normalizedActivityType)}; current=${getActivityName(previousActivity)}")
+            return
+        }
 
-        Log.d(TAG, "Activity update: ${getActivityName(activityType)}, Enter: $isInActivity")
+        currentActivity = normalizedActivityType
+        isInActivity = enteringActivity
+
+        Log.d(TAG, "Activity update: ${getActivityName(normalizedActivityType)} (raw=$activityType), Enter: $isInActivity")
 
         serviceScope.launch {
-            if (isInActivity) {
-                // Save any previous activity before starting new one
+            if (enteringActivity) {
                 savePendingData()
 
-                // Entering a new activity - create database record immediately
-                if (activityType == DetectedActivity.STILL) {
-                    startStillTracking()
-                } else if (activityType in MOVEMENT_ACTIVITIES) {
-                    startMovementTracking(activityType)
+                when (normalizedActivityType) {
+                    DetectedActivity.STILL -> startStillTracking()
+                    in MOVEMENT_ACTIVITIES -> startMovementTracking(normalizedActivityType)
                 }
             } else {
-                // Exiting an activity - finalize the record
-                if (previousActivity == DetectedActivity.STILL) {
-                    endStillTracking()
-                } else if (previousActivity in MOVEMENT_ACTIVITIES) {
-                    endMovementTracking(previousActivity)
+                when (previousActivity) {
+                    DetectedActivity.STILL -> endStillTracking()
+                    in MOVEMENT_ACTIVITIES -> endMovementTracking(previousActivity)
                 }
             }
         }
 
-        // Notify UI about the activity change
         val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
-            putExtra(EXTRA_ACTIVITY_TYPE, activityType)
+            putExtra(EXTRA_ACTIVITY_TYPE, normalizedActivityType)
             putExtra(EXTRA_TRANSITION_TYPE, transitionType)
+            putExtra(MainActivity.EXTRA_ACTIVITY_NAME, getActivityName(normalizedActivityType))
         }
         sendBroadcast(uiIntent)
 
-        updateLocationTrackingForActivity(activityType, isInActivity)
+        updateLocationTrackingForActivity(normalizedActivityType, enteringActivity)
+        updateNotification()
+    }
+
+
+    private fun shouldAcceptEntry(activityType: Int): Boolean {
+        return when (activityType) {
+            DetectedActivity.STILL -> shouldAcceptStillEntry()
+            DetectedActivity.WALKING, DetectedActivity.ON_FOOT -> isMovementSpeedWithinRange(activityType, 0.4f, 2.8f)
+            DetectedActivity.RUNNING -> isMovementSpeedWithinRange(activityType, 2.0f, Float.MAX_VALUE)
+            DetectedActivity.ON_BICYCLE -> isMovementSpeedWithinRange(activityType, 3.0f, Float.MAX_VALUE)
+            DetectedActivity.IN_VEHICLE -> isMovementSpeedWithinRange(activityType, 4.5f, Float.MAX_VALUE)
+            else -> true
+        }
+    }
+
+    private fun shouldAcceptStillEntry(): Boolean {
+        val location = lastKnownLocation
+        val hasSpeed = location?.hasSpeed() == true
+        val speed = location?.speed ?: 0f
+        val shortGap = movementStartTime?.let { Date().time - it.time < TimeUnit.MINUTES.toMillis(2) } ?: false
+
+        if (hasSpeed && speed > 1.2f) {
+            Log.d(TAG, "Ignoring Still enter; speed=${'$'}speed")
+            return false
+        }
+        if (hasMovedBeyondThreshold) {
+            Log.d(TAG, "Ignoring Still enter; movement radius threshold exceeded")
+            return false
+        }
+        if (shortGap) {
+            Log.d(TAG, "Ignoring Still enter; last movement ended too recently")
+            return false
+        }
+        return true
+    }
+
+    private fun isMovementSpeedWithinRange(activityType: Int, minSpeed: Float, maxSpeed: Float): Boolean {
+        val location = lastKnownLocation
+        val hasSpeed = location?.hasSpeed() == true
+        if (!hasSpeed) {
+            return true
+        }
+        val speed = location!!.speed
+        val withinRange = speed >= minSpeed && speed <= maxSpeed
+        if (!withinRange) {
+            Log.d(TAG, "Ignoring ${getActivityName(activityType)} enter; speed=${'$'}speed not in [${'$'}minSpeed, ${'$'}maxSpeed]")
+        }
+        return withinRange
+    }
+
+    private fun bootstrapActivity(activityType: Int) {
+        val normalized = normalizeActivityType(activityType)
+        currentActivity = normalized
+        isInActivity = false
+
+        hasMovedBeyondThreshold = false
+        maxDistanceFromCenter = 0f
+        movementStartLocation = lastKnownLocation
+        movementCenterLocation = lastKnownLocation
+        movementStartTime = null
+
+        createLocationRequest(normalized)
+        stopLocationUpdates()
+        startLocationUpdates()
+
+        val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
+            putExtra(EXTRA_ACTIVITY_TYPE, normalized)
+            putExtra(EXTRA_TRANSITION_TYPE, ActivityTransition.ACTIVITY_TRANSITION_ENTER)
+            putExtra(MainActivity.EXTRA_ACTIVITY_NAME, getActivityName(normalized))
+        }
+        sendBroadcast(uiIntent)
         updateNotification()
     }
 
@@ -615,6 +704,14 @@ class LocationService : Service() {
         }
     }
 
+    private fun normalizeActivityType(activityType: Int): Int {
+        return if (activityType == DetectedActivity.UNKNOWN) {
+            DetectedActivity.STILL
+        } else {
+            activityType
+        }
+    }
+
     private fun getActivityName(activityType: Int): String {
         return when (activityType) {
             DetectedActivity.IN_VEHICLE -> "Driving"
@@ -623,7 +720,7 @@ class LocationService : Service() {
             DetectedActivity.RUNNING -> "Running"
             DetectedActivity.STILL -> "Still"
             DetectedActivity.WALKING -> "Walking"
-            DetectedActivity.UNKNOWN -> "Unknown"
+            DetectedActivity.UNKNOWN -> "Still"
             else -> "Unknown"
         }
     }
