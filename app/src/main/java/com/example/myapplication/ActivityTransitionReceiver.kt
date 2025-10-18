@@ -40,7 +40,7 @@ class ActivityTransitionReceiver : BroadcastReceiver() {
 
     private fun handleActivityTransitions(context: Context, result: ActivityTransitionResult) {
         for (event in result.transitionEvents) {
-            val normalizedActivityType = normalizeActivityType(event.activityType)
+            val normalizedActivityType = normalizeActivityType(event.activityType) ?: continue
             val activityName = getActivityName(normalizedActivityType)
             val transitionType = getTransitionType(event.transitionType)
             val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
@@ -195,11 +195,11 @@ class ActivityTransitionReceiver : BroadcastReceiver() {
         // Add your custom logic when on-foot activity ends
     }
 
-    private fun normalizeActivityType(activityType: Int): Int {
-        return if (activityType == DetectedActivity.UNKNOWN) {
-            DetectedActivity.STILL
-        } else {
-            activityType
+    private fun normalizeActivityType(activityType: Int): Int? {
+        return when (activityType) {
+            DetectedActivity.UNKNOWN -> null
+            DetectedActivity.ON_FOOT -> DetectedActivity.WALKING
+            else -> activityType
         }
     }
 

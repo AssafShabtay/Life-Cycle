@@ -26,6 +26,7 @@ class LocationService : Service() {
     private lateinit var locationCallback: LocationCallback
     private lateinit var database: ActivityDatabase
     private lateinit var dao: ActivityDao
+    private lateinit var sleepDetectionManager: SleepDetectionManager
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val saveHandler = Handler(Looper.getMainLooper())
@@ -57,6 +58,7 @@ class LocationService : Service() {
     // Periodic save interval (milliseconds)
     private val SAVE_INTERVAL = 30000L // Save every 30 seconds
 
+
     companion object {
         const val NOTIFICATION_ID = 101
         const val CHANNEL_ID = "LocationServiceChannel"
@@ -64,6 +66,7 @@ class LocationService : Service() {
         const val ACTION_ACTIVITY_UPDATE_UI = "com.example.myapplication.ACTIVITY_UPDATE_UI"
         const val EXTRA_ACTIVITY_TYPE = "activity_type"
         const val EXTRA_TRANSITION_TYPE = "transition_type"
+        const val EXTRA_ACTIVITY_NAME = "extra_activity_name"
         // Activity types that involve movement
         val MOVEMENT_ACTIVITIES = setOf(
             DetectedActivity.IN_VEHICLE,
@@ -79,6 +82,7 @@ class LocationService : Service() {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         database = ActivityDatabase.getDatabase(this)
         dao = database.activityDao()
+        sleepDetectionManager = SleepDetectionManager(dao)
         createLocationCallback()
         createLocationRequest(DetectedActivity.UNKNOWN)
         startPeriodicSave()
@@ -198,46 +202,79 @@ class LocationService : Service() {
 
     private fun handleActivityUpdate(activityType: Int, transitionType: Int) {
         val normalizedActivityType = normalizeActivityType(activityType)
+        if (normalizedActivityType == DetectedActivity.UNKNOWN) {
+            Log.d(TAG, "Ignoring unknown activity update (raw=$activityType)")
+            return
+        }
+
         val previousActivity = currentActivity
+        val wasInActivity = isInActivity
         val enteringActivity = transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
 
-        currentActivity = normalizedActivityType
-        isInActivity = enteringActivity
+        Log.d(
+            TAG,
+            "Activity update: ${getActivityName(normalizedActivityType)} (raw=$activityType), enter=$enteringActivity"
+        )
 
-        Log.d(TAG, "Activity update: ${getActivityName(normalizedActivityType)} (raw=$activityType), Enter: $isInActivity")
+        if (enteringActivity) {
+            if (wasInActivity && previousActivity == normalizedActivityType) {
+                Log.d(TAG, "Duplicate enter for ${getActivityName(normalizedActivityType)} ignored")
+                return
+            }
 
-        serviceScope.launch {
-            if (enteringActivity) {
-                // Save any previous activity before starting new one
-                savePendingData()
+            currentActivity = normalizedActivityType
+            isInActivity = true
 
-                // Entering a new activity - create database record immediately
-                if (normalizedActivityType == DetectedActivity.STILL) {
-                    startStillTracking()
-                } else if (normalizedActivityType in MOVEMENT_ACTIVITIES) {
-                    startMovementTracking(normalizedActivityType)
+            serviceScope.launch {
+                if (wasInActivity) {
+                    finalizeActivity(previousActivity)
                 }
-            } else {
-                // Exiting an activity - finalize the record
-                if (previousActivity == DetectedActivity.STILL) {
-                    endStillTracking()
-                } else if (previousActivity in MOVEMENT_ACTIVITIES) {
-                    endMovementTracking(previousActivity)
+                when {
+                    normalizedActivityType == DetectedActivity.STILL -> startStillTracking()
+                    normalizedActivityType in MOVEMENT_ACTIVITIES -> startMovementTracking(normalizedActivityType)
                 }
             }
+
+            sendActivityUpdate(normalizedActivityType, transitionType)
+            updateLocationTrackingForActivity(normalizedActivityType, true)
+        } else {
+            if (!wasInActivity || previousActivity != normalizedActivityType) {
+                Log.d(
+                    TAG,
+                    "Exit for ${getActivityName(normalizedActivityType)} ignored (current=${getActivityName(previousActivity)}, inActivity=$wasInActivity)"
+                )
+                return
+            }
+
+            isInActivity = false
+
+            serviceScope.launch {
+                finalizeActivity(normalizedActivityType)
+            }
+
+            currentActivity = DetectedActivity.UNKNOWN
+            sendActivityUpdate(currentActivity, transitionType)
+            updateLocationTrackingForActivity(currentActivity, false)
         }
 
-        // Notify UI about the activity change
-        val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
-            putExtra(EXTRA_ACTIVITY_TYPE, normalizedActivityType)
-            putExtra(EXTRA_TRANSITION_TYPE, transitionType)
-        }
-        sendBroadcast(uiIntent)
-
-        updateLocationTrackingForActivity(normalizedActivityType, enteringActivity)
         updateNotification()
     }
 
+    private fun sendActivityUpdate(activityType: Int, transitionType: Int) {
+        val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
+            putExtra(EXTRA_ACTIVITY_TYPE, activityType)
+            putExtra(EXTRA_TRANSITION_TYPE, transitionType)
+            putExtra(EXTRA_ACTIVITY_NAME, getActivityName(activityType))
+        }
+        sendBroadcast(uiIntent)
+    }
+
+    private suspend fun finalizeActivity(activityType: Int) {
+        when {
+            activityType == DetectedActivity.STILL -> endStillTracking()
+            activityType in MOVEMENT_ACTIVITIES -> endMovementTracking(activityType)
+        }
+    }
     private suspend fun startStillTracking() {
         Log.d(TAG, "Starting still tracking - creating database record immediately")
 
@@ -260,27 +297,46 @@ class LocationService : Service() {
     private suspend fun endStillTracking() {
         Log.d(TAG, "Ending still tracking - finalizing database record")
 
-        // Finalize the still location record
-        if (stillStartLocation != null && stillStartTime != null && currentStillLocationId != null) {
-            val duration = Date().time - stillStartTime!!.time
-            val existingLocation = dao.getStillLocationById(currentStillLocationId!!)
+        val startTime = stillStartTime
+        val endTime = Date()
+        var finalLatitude: Double? = lastKnownLocation?.latitude ?: stillStartLocation?.latitude
+        var finalLongitude: Double? = lastKnownLocation?.longitude ?: stillStartLocation?.longitude
 
+        if (currentStillLocationId != null && startTime != null) {
+            val existingLocation = dao.getStillLocationById(currentStillLocationId!!)
             existingLocation?.let {
-                val finalLocation = it.copy(
+                if (finalLatitude == null) {
+                    finalLatitude = it.latitude
+                }
+                if (finalLongitude == null) {
+                    finalLongitude = it.longitude
+                }
+
+                val duration = endTime.time - startTime.time
+                val updated = it.copy(
                     duration = duration,
-                    latitude = lastKnownLocation?.latitude ?: it.latitude,
-                    longitude = lastKnownLocation?.longitude ?: it.longitude
+                    latitude = finalLatitude ?: it.latitude,
+                    longitude = finalLongitude ?: it.longitude
                 )
-                dao.updateStillLocation(finalLocation)
+                dao.updateStillLocation(updated)
                 Log.d(TAG, "Finalized still location: duration ${duration / 1000}s")
             }
         }
 
-        // Reset tracking variables
+        if (startTime != null) {
+            sleepDetectionManager.processStillSession(
+                startTime = startTime,
+                endTime = endTime,
+                latitude = finalLatitude,
+                longitude = finalLongitude
+            )
+        }
+
         stillStartLocation = null
         stillStartTime = null
         currentStillLocationId = null
     }
+
 
     private suspend fun startMovementTracking(activityType: Int) {
         Log.d(TAG, "Starting movement tracking for ${getActivityName(activityType)} - creating database record immediately")
@@ -617,10 +673,10 @@ class LocationService : Service() {
     }
 
     private fun normalizeActivityType(activityType: Int): Int {
-        return if (activityType == DetectedActivity.UNKNOWN) {
-            DetectedActivity.STILL
-        } else {
-            activityType
+        return when (activityType) {
+            DetectedActivity.UNKNOWN -> DetectedActivity.UNKNOWN
+            DetectedActivity.ON_FOOT -> DetectedActivity.WALKING
+            else -> activityType
         }
     }
 

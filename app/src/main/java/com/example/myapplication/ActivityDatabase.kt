@@ -29,6 +29,19 @@ data class StillLocation(
     val wasSupposedToBeActivity: String? = null // If this was detected during a movement activity
 )
 
+
+// Entity for detected sleep sessions
+@Entity(tableName = "sleep_sessions")
+data class SleepSession(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val startTime: Date,
+    val endTime: Date,
+    val duration: Long,
+    val latitude: Double?,
+    val longitude: Double?,
+    val source: String = "auto"
+)
 // Entity for movement activities
 @Entity(tableName = "movement_activities")
 data class MovementActivity(
@@ -110,6 +123,9 @@ interface ActivityDao {
     suspend fun insertStillLocation(stillLocation: StillLocation): Long
 
     @Insert
+    suspend fun insertSleepSession(session: SleepSession): Long
+
+    @Insert
     suspend fun insertMovementActivity(activity: MovementActivity): Long
 
     @Insert
@@ -135,6 +151,12 @@ interface ActivityDao {
 
     @Query("SELECT * FROM still_locations ORDER BY timestamp DESC")
     suspend fun getAllStillLocations(): List<StillLocation>
+
+    @Query("SELECT * FROM sleep_sessions ORDER BY startTime DESC")
+    suspend fun getAllSleepSessions(): List<SleepSession>
+
+    @Query("SELECT * FROM sleep_sessions WHERE startTime < :endTime AND endTime > :startTime LIMIT 1")
+    suspend fun getOverlappingSleepSession(startTime: Date, endTime: Date): SleepSession?
 
     @Query("SELECT * FROM movement_activities ORDER BY startTime DESC")
     suspend fun getAllMovementActivities(): List<MovementActivity>
@@ -226,13 +248,14 @@ interface GeofenceDao {
 @Database(
     entities = [
         StillLocation::class,
+        SleepSession::class,
         MovementActivity::class,
         LocationTrack::class,
         LocationSlot::class,
         GeofenceEvent::class,
         LocationVisit::class
     ],
-    version = 3, // Incremented for new tables
+    version = 4, // Incremented for new tables
     exportSchema = false
 )
 @TypeConverters(Converters::class)

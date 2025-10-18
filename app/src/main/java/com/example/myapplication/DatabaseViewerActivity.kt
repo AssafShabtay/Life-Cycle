@@ -185,7 +185,7 @@ private fun saveActivityColorPreference(context: Context, slot: ActivityTimeSlot
     editor.apply()
 }
 
-private fun applySavedColors(context: Context, slots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
+fun applySavedColors(context: Context, slots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
     if (slots.isEmpty()) return slots
     val preferences = context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
     return slots.map { slot ->
@@ -564,7 +564,7 @@ fun MiniPieChart(
         )
 
         if (data.isNotEmpty()) {
-            val gapPerSideDegrees = if (data.size > 1) 0.6f else 0f
+            val gapPerSideDegrees = 0f
 
             data.forEach { slot ->
                 val calendar = Calendar.getInstance()
@@ -1204,7 +1204,7 @@ fun AnimatedPieChart(
             }
 
             var angleRemaining = 360f * animationProgress
-            val gapPerSideDegrees = if (visualSegments.size > 1) 0.6f else 0f
+            val gapPerSideDegrees = 0f
             visualSegments.forEach { segment ->
                 val segmentDisplay = segment.displayAngle
                 val visibleFraction = when {
@@ -2063,4 +2063,5 @@ fun formatDuration(milliseconds: Long): String {
         else -> "${seconds}s"
     }
 }
+
 

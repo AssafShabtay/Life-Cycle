@@ -1,0 +1,150 @@
+diff --git a/app/src/main/java/com/example/myapplication/LocationService.kt b/app/src/main/java/com/example/myapplication/LocationService.kt
+--- a/app/src/main/java/com/example/myapplication/LocationService.kt
++++ b/app/src/main/java/com/example/myapplication/LocationService.kt
+@@
+-        const val EXTRA_ACTIVITY_TYPE = \"activity_type\"
+-        const val EXTRA_TRANSITION_TYPE = \"transition_type\"
++        const val EXTRA_ACTIVITY_TYPE = \"activity_type\"
++        const val EXTRA_TRANSITION_TYPE = \"transition_type\"
++        const val EXTRA_ACTIVITY_NAME = \"extra_activity_name\"
+@@
+-    private fun handleActivityUpdate(activityType: Int, transitionType: Int) {
+-        val normalizedActivityType = normalizeActivityType(activityType)
+-        val previousActivity = currentActivity
+-        val enteringActivity = transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
+-
+-        currentActivity = normalizedActivityType
+-        isInActivity = enteringActivity
+-
+-        Log.d(TAG, \"Activity update:  (raw=), Enter: \")
+-
+-        serviceScope.launch {
+-            if (enteringActivity) {
+-                // Save any previous activity before starting new one
+-                savePendingData()
+-
+-                // Entering a new activity - create database record immediately
+-                if (normalizedActivityType == DetectedActivity.STILL) {
+-                    startStillTracking()
+-                } else if (normalizedActivityType in MOVEMENT_ACTIVITIES) {
+-                    startMovementTracking(normalizedActivityType)
+-                }
+-            } else {
+-                // Exiting an activity - finalize the record
+-                if (previousActivity == DetectedActivity.STILL) {
+-                    endStillTracking()
+-                } else if (previousActivity in MOVEMENT_ACTIVITIES) {
+-                    endMovementTracking(previousActivity)
+-                }
+-            }
+-        }
+-
+-        // Notify UI about the activity change
+-        val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
+-            putExtra(EXTRA_ACTIVITY_TYPE, normalizedActivityType)
+-            putExtra(EXTRA_TRANSITION_TYPE, transitionType)
+-        }
+-        sendBroadcast(uiIntent)
+-
+-        updateLocationTrackingForActivity(normalizedActivityType, enteringActivity)
+-        updateNotification()
+-    }
+-
+-
++    private fun handleActivityUpdate(activityType: Int, transitionType: Int) {
++        val normalizedActivityType = normalizeActivityType(activityType)
++        if (normalizedActivityType == DetectedActivity.UNKNOWN) {
++            Log.d(TAG, \"Ignoring unknown activity update (raw=)\")
++            return
++        }
++
++        val previousActivity = currentActivity
++        val wasInActivity = isInActivity
++        val enteringActivity = transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
++
++        Log.d(
++            TAG,
++            \"Activity update:  (raw=), enter=\"
++        )
++
++        if (enteringActivity) {
++            if (wasInActivity && previousActivity == normalizedActivityType) {
++                Log.d(TAG, \"Duplicate enter for  ignored\")
++                return
++            }
++
++            currentActivity = normalizedActivityType
++            isInActivity = true
++
++            serviceScope.launch {
++                if (wasInActivity) {
++                    finalizeActivity(previousActivity)
++                }
++                when {
++                    normalizedActivityType == DetectedActivity.STILL -> startStillTracking()
++                    normalizedActivityType in MOVEMENT_ACTIVITIES -> startMovementTracking(normalizedActivityType)
++                }
++            }
++
++            sendActivityUpdate(normalizedActivityType, transitionType)
++            updateLocationTrackingForActivity(normalizedActivityType, true)
++        } else {
++            if (!wasInActivity || previousActivity != normalizedActivityType) {
++                Log.d(
++                    TAG,
++                    \"Exit for  ignored (current=, inActivity=)\"
++                )
++                return
++            }
++
++            isInActivity = false
++
++            serviceScope.launch {
++                finalizeActivity(normalizedActivityType)
++            }
++
++            currentActivity = DetectedActivity.UNKNOWN
++            sendActivityUpdate(currentActivity, transitionType)
++            updateLocationTrackingForActivity(currentActivity, false)
++        }
++
++        updateNotification()
++    }
++
++    private fun sendActivityUpdate(activityType: Int, transitionType: Int) {
++        val uiIntent = Intent(ACTION_ACTIVITY_UPDATE_UI).apply {
++            putExtra(EXTRA_ACTIVITY_TYPE, activityType)
++            putExtra(EXTRA_TRANSITION_TYPE, transitionType)
++            putExtra(EXTRA_ACTIVITY_NAME, getActivityName(activityType))
++        }
++        sendBroadcast(uiIntent)
++    }
++
++    private suspend fun finalizeActivity(activityType: Int) {
++        when {
++            activityType == DetectedActivity.STILL -> endStillTracking()
++            activityType in MOVEMENT_ACTIVITIES -> endMovementTracking(activityType)
++        }
++    }
++
++
+@@
+-    private fun normalizeActivityType(activityType: Int): Int {
+-        return if (activityType == DetectedActivity.UNKNOWN) {
+-            DetectedActivity.STILL
+-        } else {
+-            activityType
+-        }
+-    }
+-
++    private fun normalizeActivityType(activityType: Int): Int {
++        return when (activityType) {
++            DetectedActivity.UNKNOWN -> DetectedActivity.UNKNOWN
++            DetectedActivity.ON_FOOT -> DetectedActivity.WALKING
++            else -> activityType
++        }
++    }
++
+@@
+-            DetectedActivity.UNKNOWN -> \"Still\"
++            DetectedActivity.UNKNOWN -> \"Detecting\"
