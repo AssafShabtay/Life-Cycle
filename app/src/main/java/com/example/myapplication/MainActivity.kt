@@ -179,9 +179,7 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(this, "Error opening database viewer", Toast.LENGTH_SHORT).show()
                         }
                     },
-                    onGenerateData = {
-                        generateExampleData()
-                    },
+                    onGenerateData = ::generateExampleData,
                     currentLocationSlot = currentLocationSlot
                 )
             }
@@ -300,6 +298,14 @@ class MainActivity : ComponentActivity() {
                     .padding(innerPadding)
                     .fillMaxSize()
             ) {
+                SummaryChartSection(
+                    activityTimeSlots = activityTimeSlots,
+                    isSummaryLoading = isSummaryLoading,
+                    summaryError = summaryError,
+                    onRefreshSummary = onRefreshSummary,
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+
                 TabRow(selectedTabIndex = selectedTab) {
                     tabs.forEachIndexed { index, title ->
                         Tab(
@@ -317,9 +323,6 @@ class MainActivity : ComponentActivity() {
                         canTrack = canTrack,
                         currentLocationSlot = currentLocationSlot,
                         activityTimeSlots = activityTimeSlots,
-                        isSummaryLoading = isSummaryLoading,
-                        summaryError = summaryError,
-                        onRefreshSummary = onRefreshSummary,
                         onViewDatabase = onViewDatabase,
                         onGenerateDataClick = onGenerateExample
                     )
@@ -341,9 +344,6 @@ class MainActivity : ComponentActivity() {
         canTrack: Boolean,
         currentLocationSlot: LocationSlot?,
         activityTimeSlots: List<ActivityTimeSlot>,
-        isSummaryLoading: Boolean,
-        summaryError: String?,
-        onRefreshSummary: () -> Unit,
         onViewDatabase: () -> Unit,
         onGenerateDataClick: () -> Unit,
     ) {
@@ -380,15 +380,6 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.padding(bottom = 16.dp),
                 color = if (canTrack) Color(0xFF4CAF50) else Color(0xFFFF9800)
             )
-
-            ActivitySummaryCard(
-                slots = activityTimeSlots,
-                isLoading = isSummaryLoading,
-                errorMessage = summaryError,
-                onRefresh = onRefreshSummary
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
 
             currentLocationSlot?.let { slot ->
                 Card(
@@ -545,11 +536,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ActivitySummaryCard(
-        slots: List<ActivityTimeSlot>,
-        isLoading: Boolean,
-        errorMessage: String?,
-        onRefresh: () -> Unit,
+    private fun SummaryChartSection(
+        activityTimeSlots: List<ActivityTimeSlot>,
+        isSummaryLoading: Boolean,
+        summaryError: String?,
+        onRefreshSummary: () -> Unit,
     ) {
         Card(
             modifier = Modifier
@@ -571,27 +562,27 @@ class MainActivity : ComponentActivity() {
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     TextButton(
-                        onClick = onRefresh,
-                        enabled = !isLoading
+                        onClick = onRefreshSummary,
+                        enabled = !isSummaryLoading
                     ) {
                         Text("Refresh")
                     }
                 }
                 Spacer(modifier = Modifier.height(12.dp))
                 when {
-                    isLoading -> {
+                    isSummaryLoading -> {
                         CircularProgressIndicator(
                             modifier = Modifier.align(Alignment.CenterHorizontally)
                         )
                     }
-                    errorMessage != null -> {
+                    summaryError != null -> {
                         Text(
-                            text = errorMessage,
+                            text = summaryError,
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodyMedium
                         )
                     }
-                    slots.isEmpty() -> {
+                    activityTimeSlots.isEmpty() -> {
                         Text(
                             text = "No activity recorded yet today.",
                             style = MaterialTheme.typography.bodyMedium,
@@ -600,13 +591,13 @@ class MainActivity : ComponentActivity() {
                     }
                     else -> {
                         AnimatedPieChart(
-                            data = slots,
+                            data = activityTimeSlots,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(220.dp)
                         )
                         Spacer(modifier = Modifier.height(8.dp))
-                        val totalMillis = slots.sumOf { it.durationMillis }
+                        val totalMillis = activityTimeSlots.sumOf { it.durationMillis }
                         val totalMinutes = totalMillis / (1000 * 60)
                         val totalHours = totalMinutes / 60
                         val remainingMinutes = totalMinutes % 60
@@ -615,6 +606,39 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+
+                        val placeSummaries = activityTimeSlots
+                            .filter { it.activityType.startsWith("Still") && (!it.placeName.isNullOrBlank() || !it.placeCategory.isNullOrBlank()) }
+                            .groupBy { slot ->
+                                when {
+                                    !slot.placeName.isNullOrBlank() && !slot.placeCategory.isNullOrBlank() -> "${slot.placeName} (${slot.placeCategory})"
+                                    !slot.placeName.isNullOrBlank() -> slot.placeName!!
+                                    !slot.placeCategory.isNullOrBlank() -> slot.placeCategory!!
+                                    else -> "Still"
+                                }
+                            }
+                            .mapValues { entry -> entry.value.sumOf { it.durationMillis } }
+                            .entries
+                            .sortedByDescending { it.value }
+
+                        if (placeSummaries.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Divider()
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Recent places",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            placeSummaries.take(3).forEach { (label, duration) ->
+                                Text(
+                                    text = "- ${label} (${formatDuration(duration)})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
                     }
                 }
             }
@@ -1188,9 +1212,3 @@ class MainActivity : ComponentActivity() {
         return ActivityTransitionRequest(transitions)
     }
 }
-
-
-
-
-
-

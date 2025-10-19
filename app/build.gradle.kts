@@ -66,6 +66,7 @@ dependencies {
     implementation(libs.androidx.room.ktx)
     implementation(libs.play.services.location)
     implementation(libs.play.services.maps)
+    implementation("com.google.android.libraries.places:places:3.4.0")
     implementation(libs.google.maps.compose)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

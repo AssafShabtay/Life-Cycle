@@ -159,7 +159,10 @@ data class ActivityTimeSlot(
     var clusterId: String? = null,
     val dayStart: Date? = null,
     val originalStartTime: Date = startTime,
-    val originalEndTime: Date = endTime
+    val originalEndTime: Date = endTime,
+    val placeName: String? = null,
+    val placeCategory: String? = null,
+    val placeAddress: String? = null
 )
 
 private const val ACTIVITY_COLOR_PREFS = "activity_color_preferences"
@@ -781,7 +784,17 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
     val allSlots = mutableListOf<ActivityTimeSlot>()
 
     stillLocations.forEach { location ->
-        val activityType = location.wasSupposedToBeActivity ?: "Still"
+        val baseStillLabel = location.wasSupposedToBeActivity?.let { "Still ($it)" } ?: "Still"
+        val activityType = when {
+            !location.placeName.isNullOrBlank() && !location.placeCategory.isNullOrBlank() -> "Still at ${location.placeName} (${location.placeCategory})"
+            !location.placeName.isNullOrBlank() -> "Still at ${location.placeName}"
+            !location.placeCategory.isNullOrBlank() -> "Still (${location.placeCategory})"
+            else -> baseStillLabel
+        }
+        val colorKey = if (activityType.startsWith("Still")) "Still" else activityType.substringBefore(" (")
+        val slotColor = defaultActivityColors[activityType]
+            ?: defaultActivityColors[colorKey]
+            ?: Color(0xFF795548)
         val recordedDuration = (location.duration ?: 0L).coerceAtLeast(0L)
         val recordedEndTime = Date(location.timestamp.time + recordedDuration)
         val isOngoing = activeReference != null && (
@@ -809,17 +822,17 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
                 startTime = slotStartTime,
                 endTime = slotEndTime,
                 durationMillis = clippedDuration,
-                color = defaultActivityColors[activityType] ?: defaultActivityColors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                ),
+                color = slotColor,
                 latitude = location.latitude,
                 longitude = location.longitude,
                 isActive = isOngoing,
-                clusterId = null,
+                clusterId = location.placeId,
                 dayStart = Date(startDate.time),
                 originalStartTime = Date(location.timestamp.time),
-                originalEndTime = rawEndTime
+                originalEndTime = rawEndTime,
+                placeName = location.placeName,
+                placeCategory = location.placeCategory,
+                placeAddress = location.placeAddress
             )
         )
     }
@@ -1729,8 +1742,10 @@ fun LocationSlotPopover(
     val scope = rememberCoroutineScope()
     val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
 
-    var slotName by remember { mutableStateOf(activitySlot.activityType) }
-    var selectedIcon by remember { mutableStateOf(getDefaultIconForActivity(activitySlot.activityType)) }
+    val defaultSlotName = activitySlot.placeName ?: activitySlot.activityType
+    val iconSeed = activitySlot.placeCategory ?: activitySlot.activityType
+    var slotName by remember { mutableStateOf(defaultSlotName) }
+    var selectedIcon by remember { mutableStateOf(getDefaultIconForActivity(iconSeed)) }
     var selectedColor by remember { mutableStateOf(activitySlot.color) }
     var radius by remember { mutableStateOf(100f) }
     var notifyOnEnter by remember { mutableStateOf(true) }
@@ -2005,12 +2020,19 @@ fun LocationSlotPopover(
 }
 
 fun getDefaultIconForActivity(activityType: String): String {
-    return when (activityType) {
-        "Still" -> "home"
-        "Walking" -> "place"
-        "Running" -> "gym"
-        "Driving" -> "work"
-        "Cycling" -> "favorite"
+    val normalized = activityType.lowercase(Locale.getDefault())
+    return when {
+        normalized.contains("restaurant") || normalized.contains("cafe") || normalized.contains("bar") || normalized.contains("food") -> "food"
+        normalized.contains("hotel") || normalized.contains("lodging") || normalized.contains("resort") -> "home"
+        normalized.contains("gym") || normalized.contains("fitness") -> "gym"
+        normalized.contains("shop") || normalized.contains("mall") || normalized.contains("store") -> "shop"
+        normalized.contains("school") || normalized.contains("university") || normalized.contains("education") -> "work"
+        normalized.contains("park") || normalized.contains("outdoor") -> "star"
+        normalized.startsWith("still") -> "home"
+        normalized.contains("walking") -> "place"
+        normalized.contains("running") -> "gym"
+        normalized.contains("driving") -> "work"
+        normalized.contains("cycling") || normalized.contains("bicycle") -> "star"
         else -> "place"
     }
 }

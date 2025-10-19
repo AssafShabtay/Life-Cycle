@@ -16,6 +16,16 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import com.example.myapplication.*
 import com.google.android.gms.location.*
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.tasks.Task
+import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.model.Place
+import com.google.android.libraries.places.api.model.PlaceLikelihood
+import com.google.android.libraries.places.api.net.FindCurrentPlaceRequest
+import com.google.android.libraries.places.api.net.PlacesClient
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.*
 import java.util.Date
 import java.util.concurrent.TimeUnit
@@ -49,6 +59,9 @@ class LocationService : Service() {
     private var stillStartTime: Date? = null
     private var currentStillLocationId: Long? = null
 
+    private var placesClient: PlacesClient? = null
+    private var placesInitializationAttempted = false
+
     // Movement detection
     private var movementCenterLocation: Location? = null
     private var maxDistanceFromCenter: Float = 0f
@@ -74,6 +87,7 @@ class LocationService : Service() {
             DetectedActivity.WALKING,
             DetectedActivity.ON_BICYCLE
         )
+        private const val STILL_PLACE_MATCH_RADIUS_METERS = 200.0
     }
 
     override fun onCreate() {
@@ -320,6 +334,7 @@ class LocationService : Service() {
                 )
                 dao.updateStillLocation(updated)
                 Log.d(TAG, "Finalized still location: duration ${duration / 1000}s")
+                requestPlaceDetailsAsync(it.id, updated.latitude, updated.longitude)
             }
         }
 
@@ -395,7 +410,8 @@ class LocationService : Service() {
                     duration = durationMillis,
                     wasSupposedToBeActivity = "On Foot (< 15 min)"
                 )
-                dao.insertStillLocation(stillLocation)
+                val stillId = dao.insertStillLocation(stillLocation)
+                requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
             } else if (!hasMovedBeyondThreshold && maxDistanceFromCenter < MOVEMENT_RADIUS_THRESHOLD) {
                 // User didn't actually move - convert to still location
                 Log.d(TAG, "User stayed within ${MOVEMENT_RADIUS_THRESHOLD}m radius - converting to still location")
@@ -412,7 +428,8 @@ class LocationService : Service() {
                     duration = durationMillis,
                     wasSupposedToBeActivity = getActivityName(activityType)
                 )
-                dao.insertStillLocation(stillLocation)
+                val stillId = dao.insertStillLocation(stillLocation)
+                requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
             } else {
                 // Finalize the movement activity with actual movement
                 val distance = startLoc.distanceTo(endLoc)
@@ -672,6 +689,171 @@ class LocationService : Service() {
         }
     }
 
+    private fun ensurePlacesClient(): PlacesClient? {
+        placesClient?.let { return it }
+        if (placesInitializationAttempted) {
+            return null
+        }
+        placesInitializationAttempted = true
+        val apiKey = getMapsApiKey()
+        if (apiKey.isNullOrBlank()) {
+            Log.w(TAG, "Google Maps API key not configured; skipping place enrichment")
+            return null
+        }
+        return try {
+            if (!Places.isInitialized()) {
+                Places.initialize(applicationContext, apiKey)
+            }
+            Places.createClient(this).also { placesClient = it }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to initialize Places SDK: ${'$'}{e.message}")
+            null
+        }
+    }
+
+    private fun getMapsApiKey(): String? {
+        return try {
+            val applicationInfo = packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+            applicationInfo.metaData?.getString("com.google.android.geo.API_KEY")
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to read Google Maps API key: ${'$'}{e.message}")
+            null
+        }
+    }
+
+    private fun requestPlaceDetailsAsync(stillLocationId: Long?, latitude: Double?, longitude: Double?) {
+        if (stillLocationId == null || latitude == null || longitude == null) return
+        serviceScope.launch {
+            try {
+                enrichStillLocationWithPlace(stillLocationId, latitude, longitude)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to enrich still location ${'$'}stillLocationId: ${'$'}{e.message}")
+            }
+        }
+    }
+
+    private suspend fun enrichStillLocationWithPlace(
+        stillLocationId: Long,
+        latitude: Double,
+        longitude: Double
+    ) {
+        val existing = dao.getStillLocationById(stillLocationId) ?: return
+        if (!existing.placeId.isNullOrBlank() || !existing.placeName.isNullOrBlank() || !existing.placeCategory.isNullOrBlank()) {
+            return
+        }
+
+        val client = ensurePlacesClient() ?: return
+
+        try {
+            val placeFields = listOf(
+                Place.Field.ID,
+                Place.Field.NAME,
+                Place.Field.ADDRESS,
+                Place.Field.LAT_LNG,
+                Place.Field.TYPES
+            )
+            val request = FindCurrentPlaceRequest.newInstance(placeFields)
+            val response = withContext(Dispatchers.Main) {
+                client.findCurrentPlace(request).await()
+            }
+
+            data class PlaceMatch(val likelihood: PlaceLikelihood, val distanceMeters: Double)
+
+            val placeMatches = response.placeLikelihoods?.mapNotNull { likelihood ->
+                val latLng = likelihood.place.latLng ?: return@mapNotNull null
+                val distance = calculateDistanceMeters(
+                    latitude,
+                    longitude,
+                    latLng.latitude,
+                    latLng.longitude
+                )
+                PlaceMatch(likelihood, distance)
+            } ?: emptyList()
+
+            if (placeMatches.isEmpty()) {
+                return
+            }
+
+            val bestMatch = placeMatches
+                .filter { it.distanceMeters <= STILL_PLACE_MATCH_RADIUS_METERS }
+                .maxByOrNull { it.likelihood.likelihood }
+                ?: placeMatches.maxByOrNull { it.likelihood.likelihood }
+
+            val bestPlace = bestMatch?.likelihood?.place ?: return
+            val category = mapPlaceTypesToCategory(bestPlace.types)
+
+            val enriched = existing.copy(
+                placeId = bestPlace.id ?: existing.placeId,
+                placeName = bestPlace.name ?: existing.placeName,
+                placeCategory = category ?: existing.placeCategory,
+                placeAddress = bestPlace.address ?: existing.placeAddress
+            )
+
+            if (enriched != existing) {
+                dao.updateStillLocation(enriched)
+                Log.d(TAG, "Enriched still location ${'$'}stillLocationId with place ${'$'}{enriched.placeName ?: enriched.placeCategory}")
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Missing location permission for Places API: ${'$'}{e.message}")
+        } catch (e: ApiException) {
+            Log.w(TAG, "Places API error: ${'$'}{e.statusCode} ${'$'}{e.message}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to enrich still location: ${'$'}{e.message}")
+        }
+    }
+
+    private fun mapPlaceTypesToCategory(types: List<Place.Type>?): String? {
+        if (types.isNullOrEmpty()) return null
+        val typeSet = types.toSet()
+        return when {
+            typeSet.any { it == Place.Type.GYM } -> "Gym"
+            typeSet.any {
+                it == Place.Type.RESTAURANT ||
+                        it == Place.Type.CAFE ||
+                        it == Place.Type.BAR ||
+                        it == Place.Type.FOOD ||
+                        it == Place.Type.MEAL_TAKEAWAY ||
+                        it == Place.Type.MEAL_DELIVERY
+            } -> "Restaurant"
+            typeSet.any { it == Place.Type.LODGING } -> "Hotel"
+            typeSet.any {
+                it == Place.Type.SHOPPING_MALL ||
+                        it == Place.Type.STORE ||
+                        it == Place.Type.DEPARTMENT_STORE ||
+                        it == Place.Type.SUPERMARKET ||
+                        it == Place.Type.GROCERY_OR_SUPERMARKET
+            } -> "Shopping"
+            typeSet.any {
+                it == Place.Type.SCHOOL ||
+                        it == Place.Type.UNIVERSITY ||
+                        it == Place.Type.PRIMARY_SCHOOL
+            } -> "Education"
+            typeSet.any {
+                it == Place.Type.PARK ||
+                        it == Place.Type.TOURIST_ATTRACTION ||
+                        it == Place.Type.CAMPGROUND
+            } -> "Park"
+            else -> types.firstOrNull()?.let { prettyPlaceType(it) }
+        }
+    }
+
+    private fun prettyPlaceType(type: Place.Type): String {
+        return type.name.lowercase().split('_').joinToString(" ") { word ->
+            word.replaceFirstChar { ch -> ch.titlecase() }
+        }
+    }
+
+    private fun calculateDistanceMeters(
+        lat1: Double,
+        lon1: Double,
+        lat2: Double,
+        lon2: Double
+    ): Double {
+        val result = FloatArray(1)
+        Location.distanceBetween(lat1, lon1, lat2, lon2, result)
+        return result.firstOrNull()?.toDouble() ?: Double.MAX_VALUE
+    }
+
     private fun normalizeActivityType(activityType: Int): Int {
         return when (activityType) {
             DetectedActivity.UNKNOWN -> DetectedActivity.UNKNOWN
@@ -693,3 +875,9 @@ class LocationService : Service() {
         }
     }
 }
+
+private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { cont ->
+    addOnSuccessListener { result -> cont.resume(result) }
+    addOnFailureListener { exception -> cont.resumeWithException(exception) }
+}
+

@@ -26,7 +26,11 @@ data class StillLocation(
     val longitude: Double,
     val timestamp: Date,
     val duration: Long? = null, // Duration in milliseconds
-    val wasSupposedToBeActivity: String? = null // If this was detected during a movement activity
+    val wasSupposedToBeActivity: String? = null, // If this was detected during a movement activity
+    val placeId: String? = null,
+    val placeName: String? = null,
+    val placeCategory: String? = null,
+    val placeAddress: String? = null
 )
 
 
