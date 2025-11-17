@@ -85,6 +85,7 @@ class LocationService : Service() {
             DetectedActivity.IN_VEHICLE,
             DetectedActivity.RUNNING,
             DetectedActivity.WALKING,
+            DetectedActivity.ON_FOOT,
             DetectedActivity.ON_BICYCLE
         )
         private const val STILL_PLACE_MATCH_RADIUS_METERS = 200.0
@@ -593,7 +594,7 @@ class LocationService : Service() {
                     .setMaxUpdateDelayMillis(TimeUnit.SECONDS.toMillis(15))
                     .build()
             }
-            DetectedActivity.WALKING -> {
+            DetectedActivity.WALKING, DetectedActivity.ON_FOOT -> {
                 LocationRequest.Builder(
                     Priority.PRIORITY_HIGH_ACCURACY,
                     TimeUnit.SECONDS.toMillis(15)  // Update every 15 seconds for better tracking
@@ -855,10 +856,10 @@ class LocationService : Service() {
     }
 
     private fun normalizeActivityType(activityType: Int): Int {
-        return when (activityType) {
-            DetectedActivity.UNKNOWN -> DetectedActivity.UNKNOWN
-            DetectedActivity.ON_FOOT -> DetectedActivity.WALKING
-            else -> activityType
+        return if (activityType == DetectedActivity.UNKNOWN) {
+            DetectedActivity.UNKNOWN
+        } else {
+            activityType
         }
     }
 

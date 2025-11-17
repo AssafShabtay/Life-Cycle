@@ -196,10 +196,10 @@ class ActivityTransitionReceiver : BroadcastReceiver() {
     }
 
     private fun normalizeActivityType(activityType: Int): Int? {
-        return when (activityType) {
-            DetectedActivity.UNKNOWN -> null
-            DetectedActivity.ON_FOOT -> DetectedActivity.WALKING
-            else -> activityType
+        return if (activityType == DetectedActivity.UNKNOWN) {
+            null
+        } else {
+            activityType
         }
     }
 
