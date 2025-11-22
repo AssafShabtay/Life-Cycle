@@ -25,6 +25,7 @@ import com.google.android.libraries.places.api.net.FindCurrentPlaceRequest
 import com.google.android.libraries.places.api.net.PlacesClient
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.max
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.*
 import java.util.Date
@@ -65,8 +66,14 @@ class LocationService : Service() {
     // Movement detection
     private var movementCenterLocation: Location? = null
     private var maxDistanceFromCenter: Float = 0f
-    private val MOVEMENT_RADIUS_THRESHOLD = 100f // 100 meters
+    private val DEFAULT_MOVEMENT_RADIUS_THRESHOLD = 100f // Fallback when we don't know the activity
+    private var movementRadiusThreshold = DEFAULT_MOVEMENT_RADIUS_THRESHOLD
     private var hasMovedBeyondThreshold = false
+    private var previousMovementLocation: Location? = null
+    private var cumulativeMovementDistance: Float = 0f
+    private val MOVEMENT_SPEED_THRESHOLD_MPS = 1.3f
+    private val MIN_STEP_DISTANCE_METERS = 8f
+    private val MAX_NOISE_ACCURACY_METERS = 75f
 
     // Periodic save interval (milliseconds)
     private val SAVE_INTERVAL = 30000L // Save every 30 seconds
@@ -188,7 +195,8 @@ class LocationService : Service() {
             // Update movement activity progress
             if (currentActivity in MOVEMENT_ACTIVITIES && movementStartTime != null && movementStartLocation != null) {
                 val endLocation = lastKnownLocation ?: movementStartLocation
-                val distance = movementStartLocation!!.distanceTo(endLocation!!)
+                val rawDistance = movementStartLocation!!.distanceTo(endLocation!!)
+                val distance = max(rawDistance, cumulativeMovementDistance)
                 val currentTime = Date()
 
                 if (currentActivityId != null && currentMovementActivity != null) {
@@ -198,7 +206,7 @@ class LocationService : Service() {
                         endLongitude = endLocation.longitude,
                         endTime = currentTime,
                         distance = distance,
-                        actuallyMoved = hasMovedBeyondThreshold || maxDistanceFromCenter > MOVEMENT_RADIUS_THRESHOLD
+                        actuallyMoved = hasMovedBeyondThreshold || maxDistanceFromCenter > movementRadiusThreshold
                     )
                     dao.updateMovementActivity(updated)
                     currentMovementActivity = updated
@@ -357,11 +365,15 @@ class LocationService : Service() {
     private suspend fun startMovementTracking(activityType: Int) {
         Log.d(TAG, "Starting movement tracking for ${getActivityName(activityType)} - creating database record immediately")
 
-        movementStartLocation = lastKnownLocation
+        movementStartLocation = lastKnownLocation?.let { Location(it) }
         movementStartTime = Date()
-        movementCenterLocation = lastKnownLocation
+        movementCenterLocation = movementStartLocation?.let { Location(it) }
+        previousMovementLocation = movementStartLocation?.let { Location(it) }
         maxDistanceFromCenter = 0f
         hasMovedBeyondThreshold = false
+        cumulativeMovementDistance = 0f
+        movementRadiusThreshold = movementThresholdFor(activityType)
+        Log.d(TAG, "Movement threshold for ${getActivityName(activityType)}: ${movementRadiusThreshold}m")
         locationBuffer.clear()
 
         // Create database record immediately
@@ -413,9 +425,9 @@ class LocationService : Service() {
                 )
                 val stillId = dao.insertStillLocation(stillLocation)
                 requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
-            } else if (!hasMovedBeyondThreshold && maxDistanceFromCenter < MOVEMENT_RADIUS_THRESHOLD) {
+            } else if (!hasMovedBeyondThreshold && maxDistanceFromCenter < movementRadiusThreshold) {
                 // User didn't actually move - convert to still location
-                Log.d(TAG, "User stayed within ${MOVEMENT_RADIUS_THRESHOLD}m radius - converting to still location")
+                Log.d(TAG, "User stayed within ${movementRadiusThreshold}m radius - converting to still location")
 
                 // Delete the movement activity record
                 dao.deleteMovementActivity(currentActivityId!!)
@@ -433,7 +445,8 @@ class LocationService : Service() {
                 requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
             } else {
                 // Finalize the movement activity with actual movement
-                val distance = startLoc.distanceTo(endLoc)
+                val rawDistance = startLoc.distanceTo(endLoc)
+                val distance = max(rawDistance, cumulativeMovementDistance)
                 val finalActivity = currentMovementActivity!!.copy(
                     endLatitude = endLoc.latitude,
                     endLongitude = endLoc.longitude,
@@ -455,6 +468,9 @@ class LocationService : Service() {
         movementCenterLocation = null
         maxDistanceFromCenter = 0f
         hasMovedBeyondThreshold = false
+        previousMovementLocation = null
+        cumulativeMovementDistance = 0f
+        movementRadiusThreshold = DEFAULT_MOVEMENT_RADIUS_THRESHOLD
         locationBuffer.clear()
         currentActivityId = null
         currentMovementActivity = null
@@ -509,16 +525,49 @@ class LocationService : Service() {
     }
 
     private suspend fun handleMovementLocation(location: Location) {
-        // Track movement to detect if user stays within 100m radius
+        if (movementCenterLocation == null) {
+            movementCenterLocation = Location(location)
+        }
+
+        val accuracy = if (location.hasAccuracy()) location.accuracy else MAX_NOISE_ACCURACY_METERS
         movementCenterLocation?.let { center ->
-            val distance = center.distanceTo(location)
-            if (distance > maxDistanceFromCenter) {
-                maxDistanceFromCenter = distance
+            val rawDistance = center.distanceTo(location)
+            val adjustedDistance = (rawDistance - accuracy).coerceAtLeast(0f)
+            if (adjustedDistance > maxDistanceFromCenter) {
+                maxDistanceFromCenter = adjustedDistance
             }
-            if (distance > MOVEMENT_RADIUS_THRESHOLD) {
+            if (!hasMovedBeyondThreshold && adjustedDistance >= movementRadiusThreshold) {
                 hasMovedBeyondThreshold = true
-                Log.d(TAG, "User moved beyond ${MOVEMENT_RADIUS_THRESHOLD}m threshold: ${distance}m")
+                Log.d(
+                    TAG,
+                    "User moved beyond ${movementRadiusThreshold}m threshold (adjusted=${adjustedDistance}m, raw=${rawDistance}m)"
+                )
             }
+        }
+
+        previousMovementLocation?.let { previous ->
+            val stepDistance = previous.distanceTo(location)
+            val accuracyPenalty = max(
+                if (previous.hasAccuracy()) previous.accuracy else 0f,
+                accuracy
+            )
+            val adjustedStep = (stepDistance - accuracyPenalty).coerceAtLeast(0f)
+            if (adjustedStep >= MIN_STEP_DISTANCE_METERS) {
+                cumulativeMovementDistance += adjustedStep
+            }
+        }
+        previousMovementLocation = Location(location)
+
+        if (!hasMovedBeyondThreshold && cumulativeMovementDistance >= movementRadiusThreshold) {
+            hasMovedBeyondThreshold = true
+            Log.d(TAG, "Cumulative distance ${cumulativeMovementDistance}m exceeded threshold ${movementRadiusThreshold}m")
+        }
+
+        if (!hasMovedBeyondThreshold && location.hasSpeed() &&
+            location.speed >= MOVEMENT_SPEED_THRESHOLD_MPS && accuracy <= MAX_NOISE_ACCURACY_METERS
+        ) {
+            hasMovedBeyondThreshold = true
+            Log.d(TAG, "Speed ${location.speed}m/s indicates movement")
         }
 
         // Add to location buffer for later saving
@@ -687,6 +736,16 @@ class LocationService : Service() {
             "Current activity: $activityName${if (currentActivity in MOVEMENT_ACTIVITIES) movementStatus else ""}"
         } else {
             "Location Tracking Active"
+        }
+    }
+
+    private fun movementThresholdFor(activityType: Int): Float {
+        return when (activityType) {
+            DetectedActivity.WALKING, DetectedActivity.ON_FOOT -> 40f
+            DetectedActivity.RUNNING -> 60f
+            DetectedActivity.ON_BICYCLE -> 80f
+            DetectedActivity.IN_VEHICLE -> 120f
+            else -> DEFAULT_MOVEMENT_RADIUS_THRESHOLD
         }
     }
 

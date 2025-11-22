@@ -246,21 +246,7 @@ fun DatabaseViewer(dao: ActivityDao) {
                     val slots = calculateActivityTimeSlots(dao, newDate)
                     activityTimeSlots = applySavedColors(context, slots)
                 }
-            },
-            onColorUpdate = { slot, newColor ->
-                saveActivityColorPreference(context, slot, newColor)
-                val targetClusterId = slot.clusterId
-                activityTimeSlots = activityTimeSlots.map { current ->
-                    val sameCluster = targetClusterId != null && current.clusterId == targetClusterId
-                    val sameActivity = targetClusterId == null && current.activityType == slot.activityType
-                    if (sameCluster || sameActivity) {
-                        current.copy(color = newColor)
-                    } else {
-                        current
-                    }
-                }
-            },
-            context = context
+            }
         )
     }
 }
@@ -271,12 +257,7 @@ fun DailyActivityPieChartWithNavigation(
     activityTimeSlots: List<ActivityTimeSlot>,
     selectedDate: Date,
     onDateChange: (Date) -> Unit,
-    onColorUpdate: (ActivityTimeSlot, Color) -> Unit,
-    context: Context
 ) {
-    var selectedSlot by remember { mutableStateOf<ActivityTimeSlot?>(null) }
-    var showLocationSlotDialog by remember { mutableStateOf(false) }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -284,24 +265,13 @@ fun DailyActivityPieChartWithNavigation(
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Calendar Date Selector
         CalendarDateSelector(
             selectedDate = selectedDate,
-            onDateSelected = { newDate ->
-                onDateChange(newDate)
-            }
+            onDateSelected = onDateChange
         )
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        Text(
-            text = "Tap a segment to create a location slot",
-            fontSize = 14.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(bottom = 16.dp)
-        )
-
-        // Clock and Pie Chart Container
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -311,45 +281,9 @@ fun DailyActivityPieChartWithNavigation(
         ) {
             AnimatedPieChart(
                 data = activityTimeSlots,
-                modifier = Modifier.fillMaxSize(),
-                onSegmentClick = { slot ->
-                    selectedSlot = slot
-                    showLocationSlotDialog = true
-                }
+                modifier = Modifier.fillMaxSize()
             )
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        ActivityRecordingsList(
-            slots = activityTimeSlots,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Quick Stats
-        if (activityTimeSlots.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(16.dp))
-            QuickStatsCard(activityTimeSlots)
-        }
-    }
-
-    // Location Slot Creation Popover
-    if (showLocationSlotDialog && selectedSlot != null) {
-        LocationSlotPopover(
-            activitySlot = selectedSlot!!,
-            onDismiss = {
-                showLocationSlotDialog = false
-                selectedSlot = null
-            },
-            onColorChange = { newColor ->
-                selectedSlot?.let { slot ->
-                    onColorUpdate(slot, newColor)
-                    selectedSlot = slot.copy(color = newColor)
-                }
-            }
-        )
     }
 }
 
@@ -907,11 +841,16 @@ private fun assignColorsByLocation(
 
     val clusterMap = mutableMapOf<String, LocationCluster>()
     val clusters = mutableListOf<LocationCluster>()
+    val movementColorCache = mutableMapOf<String, Color>()
+    val usedMovementColors = mutableSetOf<Int>()
 
     return slots.map { slot ->
         val lat = slot.latitude
         val lon = slot.longitude
-        if (lat != null && lon != null) {
+        val isStayActivity = slot.activityType.startsWith("Still", ignoreCase = true)
+
+        if (isStayActivity && lat != null && lon != null) {
+            // Existing clustering keeps stays tied to a location color
             val coarseKey = coarseLocationKey(lat, lon)
             val existingByKey = clusterMap[coarseKey]
             val cluster = existingByKey ?: clusters.firstOrNull {
@@ -939,11 +878,28 @@ private fun assignColorsByLocation(
                 newCluster
             }
             slot.copy(color = finalCluster.color, clusterId = finalCluster.id)
-        } else {
+        } else if (isStayActivity) {
             val fallbackColor = defaultActivityColors[slot.activityType]
                 ?: defaultActivityColors["Still"]
                 ?: Color(0xFF9E9E9E)
             slot.copy(clusterId = null, color = fallbackColor)
+        } else {
+            val normalizedType = slot.activityType.substringBefore(" (").ifBlank { slot.activityType }
+            val uniqueColor = movementColorCache.getOrPut(normalizedType) {
+                val baseColor = defaultActivityColors[slot.activityType]
+                    ?: defaultActivityColors[normalizedType]
+                    ?: slot.color
+                var candidate = baseColor
+                var attempt = 0
+                while (usedMovementColors.contains(candidate.toArgb())) {
+                    candidate = generateColorForKey("activity:$normalizedType:$attempt")
+                    attempt++
+                }
+                usedMovementColors.add(candidate.toArgb())
+                candidate
+            }
+            // Movement events ignore location clustering so they keep their own unique colors
+            slot.copy(clusterId = null, color = uniqueColor)
         }
     }
 }
