@@ -174,7 +174,7 @@ private const val LOCATION_PREF_PREFIX = "location:"
 private const val ACTIVITY_PREF_PREFIX = "activity:"
 private const val PIE_REFRESH_INTERVAL_MILLIS = 10 * 60 * 1000L
 
-private fun saveActivityColorPreference(context: Context, slot: ActivityTimeSlot, color: Color) {
+fun saveActivityColorPreference(context: Context, slot: ActivityTimeSlot, color: Color) {
     val preferences = context.getSharedPreferences(ACTIVITY_COLOR_PREFS, Context.MODE_PRIVATE)
     val editor = preferences.edit()
     val locationKey = slot.clusterId?.let { locationPreferenceKey(it) }
@@ -750,34 +750,29 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
         val slotEndTime = Date(slotEndMillis)
         val clippedDuration = slotEndMillis - slotStartMillis
 
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = slotStartTime,
-                endTime = slotEndTime,
-                durationMillis = clippedDuration,
-                color = slotColor,
-                latitude = location.latitude,
-                longitude = location.longitude,
-                isActive = isOngoing,
-                clusterId = location.placeId,
-                dayStart = Date(startDate.time),
-                originalStartTime = Date(location.timestamp.time),
-                originalEndTime = rawEndTime,
-                placeName = location.placeName,
-                placeCategory = location.placeCategory,
-                placeAddress = location.placeAddress
-            )
+        val baseSlot = ActivityTimeSlot(
+            activityType = activityType,
+            startTime = slotStartTime,
+            endTime = slotEndTime,
+            durationMillis = clippedDuration,
+            color = slotColor,
+            latitude = location.latitude,
+            longitude = location.longitude,
+            isActive = isOngoing,
+            clusterId = location.placeId,
+            dayStart = null,
+            originalStartTime = Date(location.timestamp.time),
+            originalEndTime = rawEndTime,
+            placeName = location.placeName,
+            placeCategory = location.placeCategory,
+            placeAddress = location.placeAddress
         )
+        allSlots.addAll(splitSlotAcrossDays(baseSlot))
     }
 
 
     movementActivities.forEach { activity ->
-        val activityType = if (activity.actuallyMoved) {
-            activity.activityType
-        } else {
-            "Still (${activity.activityType})"
-        }
+        val activityType = activity.activityType
 
         val recordedDuration = (activity.endTime.time - activity.startTime.time).coerceAtLeast(0L)
         val isOngoing = activeReference != null && (
@@ -799,25 +794,24 @@ suspend fun calculateActivityTimeSlotsForRange(dao: ActivityDao, startDate: Date
         val slotEndTime = Date(slotEndMillis)
         val clippedDuration = slotEndMillis - slotStartMillis
 
-        allSlots.add(
-            ActivityTimeSlot(
-                activityType = activityType,
-                startTime = slotStartTime,
-                endTime = slotEndTime,
-                durationMillis = clippedDuration,
-                color = defaultActivityColors[activityType] ?: defaultActivityColors.getOrDefault(
-                    activityType.substringBefore(" ("),
-                    Color(0xFF795548)
-                ),
-                latitude = activity.startLatitude,
-                longitude = activity.startLongitude,
-                isActive = isOngoing,
-                clusterId = null,
-                dayStart = Date(startDate.time),
-                originalStartTime = Date(activity.startTime.time),
-                originalEndTime = Date(rawEndMillis)
-            )
+        val baseMovementSlot = ActivityTimeSlot(
+            activityType = activityType,
+            startTime = slotStartTime,
+            endTime = slotEndTime,
+            durationMillis = clippedDuration,
+            color = defaultActivityColors[activityType] ?: defaultActivityColors.getOrDefault(
+                activityType.substringBefore(" ("),
+                Color(0xFF795548)
+            ),
+            latitude = activity.startLatitude,
+            longitude = activity.startLongitude,
+            isActive = isOngoing,
+            clusterId = null,
+            dayStart = null,
+            originalStartTime = Date(activity.startTime.time),
+            originalEndTime = Date(rawEndMillis)
         )
+        allSlots.addAll(splitSlotAcrossDays(baseMovementSlot))
     }
 
 
@@ -1381,6 +1375,52 @@ fun getIconVectorForActivity(activityType: String): ImageVector {
     }
 }
 
+
+
+private fun splitSlotAcrossDays(slot: ActivityTimeSlot): List<ActivityTimeSlot> {
+    val segments = mutableListOf<ActivityTimeSlot>()
+    var currentStart = slot.startTime
+    val finalEnd = slot.endTime
+    if (!currentStart.before(finalEnd)) {
+        return emptyList()
+    }
+
+    while (currentStart.before(finalEnd)) {
+        val dayStartCalendar = Calendar.getInstance().apply {
+            time = currentStart
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val dayStart = dayStartCalendar.time
+        val dayEnd = Calendar.getInstance().apply {
+            time = dayStart
+            add(Calendar.DAY_OF_YEAR, 1)
+        }.time
+
+        val segmentEnd = if (finalEnd.before(dayEnd)) finalEnd else dayEnd
+        val duration = segmentEnd.time - currentStart.time
+        if (duration <= 0L) {
+            break
+        }
+        val isLastSegment = !segmentEnd.before(finalEnd)
+
+        segments.add(
+            slot.copy(
+                startTime = currentStart,
+                endTime = segmentEnd,
+                durationMillis = duration,
+                dayStart = dayStart,
+                isActive = slot.isActive && isLastSegment
+            )
+        )
+
+        currentStart = segmentEnd
+    }
+
+    return segments
+}
 
 private fun mergeAndFilterSlots(sortedSlots: List<ActivityTimeSlot>): List<ActivityTimeSlot> {
     val mergedSlots = mutableListOf<ActivityTimeSlot>()

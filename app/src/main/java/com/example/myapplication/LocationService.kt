@@ -407,59 +407,20 @@ class LocationService : Service() {
             val durationMillis = endTime.time - startTime.time
             val durationMinutes = durationMillis / (1000 * 60)
 
-            // Handle ON_FOOT activities shorter than 15 minutes
-            if (activityType == DetectedActivity.ON_FOOT && durationMinutes < 15) {
-                Log.d(TAG, "ON_FOOT activity duration (${durationMinutes}m) is less than 15 minutes - converting to still location")
+            val rawDistance = startLoc.distanceTo(endLoc)
+            val distance = max(rawDistance, cumulativeMovementDistance)
+            val finalActivity = currentMovementActivity!!.copy(
+                endLatitude = endLoc.latitude,
+                endLongitude = endLoc.longitude,
+                endTime = endTime,
+                distance = distance,
+                actuallyMoved = hasMovedBeyondThreshold || maxDistanceFromCenter > movementRadiusThreshold
+            )
+            dao.updateMovementActivity(finalActivity)
+            Log.d(TAG, "Finalized movement activity: distance ${distance}m, duration ${durationMinutes}min")
 
-                // Delete the movement activity record
-                dao.deleteMovementActivity(currentActivityId!!)
-
-                // Create a still location instead
-                val centerLoc = movementCenterLocation ?: startLoc
-                val stillLocation = StillLocation(
-                    latitude = centerLoc.latitude,
-                    longitude = centerLoc.longitude,
-                    timestamp = startTime,
-                    duration = durationMillis,
-                    wasSupposedToBeActivity = "On Foot (< 15 min)"
-                )
-                val stillId = dao.insertStillLocation(stillLocation)
-                requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
-            } else if (!hasMovedBeyondThreshold && maxDistanceFromCenter < movementRadiusThreshold) {
-                // User didn't actually move - convert to still location
-                Log.d(TAG, "User stayed within ${movementRadiusThreshold}m radius - converting to still location")
-
-                // Delete the movement activity record
-                dao.deleteMovementActivity(currentActivityId!!)
-
-                // Create a still location instead
-                val centerLoc = movementCenterLocation ?: startLoc
-                val stillLocation = StillLocation(
-                    latitude = centerLoc.latitude,
-                    longitude = centerLoc.longitude,
-                    timestamp = startTime,
-                    duration = durationMillis,
-                    wasSupposedToBeActivity = getActivityName(activityType)
-                )
-                val stillId = dao.insertStillLocation(stillLocation)
-                requestPlaceDetailsAsync(stillId, stillLocation.latitude, stillLocation.longitude)
-            } else {
-                // Finalize the movement activity with actual movement
-                val rawDistance = startLoc.distanceTo(endLoc)
-                val distance = max(rawDistance, cumulativeMovementDistance)
-                val finalActivity = currentMovementActivity!!.copy(
-                    endLatitude = endLoc.latitude,
-                    endLongitude = endLoc.longitude,
-                    endTime = endTime,
-                    distance = distance,
-                    actuallyMoved = true
-                )
-                dao.updateMovementActivity(finalActivity)
-                Log.d(TAG, "Finalized movement activity: distance ${distance}m, duration ${durationMinutes}min")
-
-                // Save any remaining location tracks
-                flushLocationBuffer()
-            }
+            // Save any remaining location tracks
+            flushLocationBuffer()
         }
 
         // Reset tracking variables
@@ -940,4 +901,5 @@ private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { cont 
     addOnSuccessListener { result -> cont.resume(result) }
     addOnFailureListener { exception -> cont.resumeWithException(exception) }
 }
+
 

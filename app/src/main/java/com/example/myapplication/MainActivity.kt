@@ -46,7 +46,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -65,6 +64,9 @@ import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.DetectedActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.ScrollState
@@ -79,8 +81,11 @@ import androidx.compose.ui.text.style.TextAlign
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import com.example.myapplication.ActivityTimeSlot
 import com.example.myapplication.AnimatedPieChart
+import com.example.myapplication.LocationSlotPopover
+import com.example.myapplication.saveActivityColorPreference
 import com.example.myapplication.applySavedColors
 import com.example.myapplication.calculateActivityTimeSlots
 import com.example.myapplication.calculateActivityTimeSlotsForRange
@@ -131,6 +136,7 @@ class MainActivity : ComponentActivity() {
     private var currentActivityState by mutableStateOf("Unknown")
     private var canTrackState by mutableStateOf(false)
     private var currentLocationSlot by mutableStateOf<LocationSlot?>(null)
+    private var locationSlotMonitorJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -161,6 +167,8 @@ class MainActivity : ComponentActivity() {
             // Still try to show basic UI
             setupUI(canTrack = false)
         }
+
+        startLocationSlotMonitor()
     }
 
     private fun setupUI(canTrack: Boolean) {
@@ -170,17 +178,6 @@ class MainActivity : ComponentActivity() {
             MyApplicationTheme {
                 MainScreen(
                     canTrack = canTrackState,
-                    currentActivityState = currentActivityState,
-                    onViewDatabase = {
-                        try {
-                            startActivity(Intent(this, DatabaseViewerActivity::class.java))
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error opening database viewer: ${e.message}")
-                            Toast.makeText(this, "Error opening database viewer", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    onGenerateData = ::generateExampleData,
-                    currentLocationSlot = currentLocationSlot
                 )
             }
         }
@@ -189,30 +186,19 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen(
         canTrack: Boolean,
-        currentActivityState: String,
-        currentLocationSlot: LocationSlot?,
-        onViewDatabase: () -> Unit,
-        onGenerateData: suspend () -> Unit,
     ) {
         val context = LocalContext.current
-        val scope = rememberCoroutineScope()
-        var selectedTab by remember { mutableStateOf(0) }
-        val overviewScrollState = rememberScrollState()
-        val trendScrollState = rememberScrollState()
-
+        var selectedDate by remember { mutableStateOf(Date()) }
         var activityTimeSlots by remember { mutableStateOf<List<ActivityTimeSlot>>(emptyList()) }
         var isSummaryLoading by remember { mutableStateOf(false) }
         var summaryError by remember { mutableStateOf<String?>(null) }
+        var selectedSlot by remember { mutableStateOf<ActivityTimeSlot?>(null) }
 
-        var trendSummary by remember { mutableStateOf<TrendSummary?>(null) }
-        var isTrendLoading by remember { mutableStateOf(false) }
-        var trendError by remember { mutableStateOf<String?>(null) }
-
-        suspend fun loadSummary() {
+        suspend fun loadSummary(date: Date) {
             isSummaryLoading = true
             summaryError = null
             try {
-                val slots = calculateActivityTimeSlots(dao, Date())
+                val slots = calculateActivityTimeSlots(dao, date)
                 activityTimeSlots = applySavedColors(context, slots)
             } catch (e: Exception) {
                 Log.e(TAG, "Error loading activity summary: ", e)
@@ -222,121 +208,61 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        suspend fun loadTrends(force: Boolean = false) {
-            if (isTrendLoading) return
-            if (!force && trendSummary != null) return
-
-            isTrendLoading = true
-            trendError = null
-            try {
-                val endCalendar = Calendar.getInstance().apply {
-                    set(Calendar.HOUR_OF_DAY, 23)
-                    set(Calendar.MINUTE, 59)
-                    set(Calendar.SECOND, 59)
-                    set(Calendar.MILLISECOND, 999)
-                }
-                val endDate = endCalendar.time
-                val startCalendar = (endCalendar.clone() as Calendar).apply {
-                    add(Calendar.DAY_OF_YEAR, -6)
-                    set(Calendar.HOUR_OF_DAY, 0)
-                    set(Calendar.MINUTE, 0)
-                    set(Calendar.SECOND, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }
-                val startDate = startCalendar.time
-
-                val slots = calculateActivityTimeSlotsForRange(dao, startDate, endDate)
-                val coloredSlots = applySavedColors(context, slots)
-                trendSummary = buildTrendSummary(coloredSlots, startDate, endDate)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error loading trends: ", e)
-                trendError = "Unable to load trends right now."
-            } finally {
-                isTrendLoading = false
-            }
+        val handleSegmentClick: (ActivityTimeSlot) -> Unit = { slot ->
+            selectedSlot = slot
         }
 
-        LaunchedEffect(canTrack, currentActivityState) {
-            loadSummary()
+        LaunchedEffect(canTrack, selectedDate) {
+            selectedSlot = null
+            loadSummary(selectedDate)
         }
-
-        LaunchedEffect(selectedTab, canTrack) {
-            if (selectedTab == 1) {
-                loadTrends()
-            }
-        }
-
-        val onRefreshSummary: () -> Unit = {
-            scope.launch { loadSummary() }
-        }
-
-        val onRetryTrends: () -> Unit = {
-            scope.launch { loadTrends(force = true) }
-        }
-
-        val onGenerateExample: () -> Unit = {
-            scope.launch {
-                try {
-                    onGenerateData()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error generating example data", e)
-                }
-                loadSummary()
-                if (selectedTab == 1) {
-                    loadTrends(force = true)
-                } else {
-                    trendSummary = null
-                }
-            }
-        }
-
-        val tabs = listOf("Overview", "Trends")
 
         Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
             Column(
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                CalendarDateSelector(
+                    selectedDate = selectedDate,
+                    onDateSelected = { newDate ->
+                        selectedDate = newDate
+                    }
+                )
+                Spacer(modifier = Modifier.height(24.dp))
                 SummaryChartSection(
                     activityTimeSlots = activityTimeSlots,
                     isSummaryLoading = isSummaryLoading,
                     summaryError = summaryError,
-                    onRefreshSummary = onRefreshSummary,
+                    onSegmentClick = handleSegmentClick
                 )
-                Spacer(modifier = Modifier.height(16.dp))
-
-                TabRow(selectedTabIndex = selectedTab) {
-                    tabs.forEachIndexed { index, title ->
-                        Tab(
-                            selected = selectedTab == index,
-                            onClick = { selectedTab = index },
-                            text = { Text(title) }
-                        )
-                    }
-                }
-
-                when (selectedTab) {
-                    0 -> OverviewTabContent(
-                        scrollState = overviewScrollState,
-                        currentActivityState = currentActivityState,
-                        canTrack = canTrack,
-                        currentLocationSlot = currentLocationSlot,
-                        activityTimeSlots = activityTimeSlots,
-                        onViewDatabase = onViewDatabase,
-                        onGenerateDataClick = onGenerateExample
-                    )
-                    else -> TrendsTabContent(
-                        scrollState = trendScrollState,
-                        trendSummary = trendSummary,
-                        isLoading = isTrendLoading,
-                        errorMessage = trendError,
-                        onRetry = onRetryTrends
+                selectedSlot?.let { slot ->
+                    LocationSlotPopover(
+                        activitySlot = slot,
+                        onDismiss = { selectedSlot = null },
+                        onColorChange = { newColor ->
+                            saveActivityColorPreference(context, slot, newColor)
+                            activityTimeSlots = activityTimeSlots.map { existing ->
+                                if (existing.activityType == slot.activityType &&
+                                    existing.startTime == slot.startTime &&
+                                    existing.endTime == slot.endTime
+                                ) {
+                                    existing.copy(color = newColor)
+                                } else {
+                                    existing
+                                }
+                            }
+                            selectedSlot = slot.copy(color = newColor)
+                        }
                     )
                 }
             }
         }
     }
+
     @Composable
     private fun OverviewTabContent(
         scrollState: ScrollState,
@@ -540,53 +466,40 @@ class MainActivity : ComponentActivity() {
         activityTimeSlots: List<ActivityTimeSlot>,
         isSummaryLoading: Boolean,
         summaryError: String?,
-        onRefreshSummary: () -> Unit,
+        onSegmentClick: (ActivityTimeSlot) -> Unit,
     ) {
         Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
+            modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant
             )
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Today Summary",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    TextButton(
-                        onClick = onRefreshSummary,
-                        enabled = !isSummaryLoading
-                    ) {
-                        Text("Refresh")
-                    }
-                }
-                Spacer(modifier = Modifier.height(12.dp))
+            Column(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
                 when {
                     isSummaryLoading -> {
                         CircularProgressIndicator(
-                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                            modifier = Modifier.padding(vertical = 48.dp)
                         )
                     }
                     summaryError != null -> {
                         Text(
                             text = summaryError,
                             color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center
                         )
                     }
                     activityTimeSlots.isEmpty() -> {
                         Text(
-                            text = "No activity recorded yet today.",
+                            text = "No activity recorded for the selected date.",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
                         )
                     }
                     else -> {
@@ -594,51 +507,9 @@ class MainActivity : ComponentActivity() {
                             data = activityTimeSlots,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(220.dp)
+                                .height(280.dp),
+                            onSegmentClick = onSegmentClick
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val totalMillis = activityTimeSlots.sumOf { it.durationMillis }
-                        val totalMinutes = totalMillis / (1000 * 60)
-                        val totalHours = totalMinutes / 60
-                        val remainingMinutes = totalMinutes % 60
-                        Text(
-                            text = "Total tracked: ${totalHours}h ${remainingMinutes}m",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-
-                        val placeSummaries = activityTimeSlots
-                            .filter { it.activityType.startsWith("Still") && (!it.placeName.isNullOrBlank() || !it.placeCategory.isNullOrBlank()) }
-                            .groupBy { slot ->
-                                when {
-                                    !slot.placeName.isNullOrBlank() && !slot.placeCategory.isNullOrBlank() -> "${slot.placeName} (${slot.placeCategory})"
-                                    !slot.placeName.isNullOrBlank() -> slot.placeName!!
-                                    !slot.placeCategory.isNullOrBlank() -> slot.placeCategory!!
-                                    else -> "Still"
-                                }
-                            }
-                            .mapValues { entry -> entry.value.sumOf { it.durationMillis } }
-                            .entries
-                            .sortedByDescending { it.value }
-
-                        if (placeSummaries.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Divider()
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Recent places",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            placeSummaries.take(3).forEach { (label, duration) ->
-                                Text(
-                                    text = "- ${label} (${formatDuration(duration)})",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-
                     }
                 }
             }
@@ -1044,7 +915,24 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Error in onDestroy: ${e.message}")
         }
+        stopLocationSlotMonitor()
         super.onDestroy()
+    }
+
+    private fun startLocationSlotMonitor() {
+        if (locationSlotMonitorJob?.isActive == true) return
+
+        locationSlotMonitorJob = lifecycleScope.launch {
+            while (isActive) {
+                checkCurrentLocationSlot()
+                delay(TimeUnit.MINUTES.toMillis(30))
+            }
+        }
+    }
+
+    private fun stopLocationSlotMonitor() {
+        locationSlotMonitorJob?.cancel()
+        locationSlotMonitorJob = null
     }
 
     private fun checkCurrentLocationSlot() {
@@ -1055,10 +943,23 @@ class MainActivity : ComponentActivity() {
                 // Check if we're currently in any active location slot
                 val activeVisits = geofenceDao.getActiveVisits()
                 if (activeVisits.isNotEmpty()) {
-                    val slotId = activeVisits.first().slotId
-                    val slot = geofenceDao.getLocationSlotById(slotId)
-                    withContext(Dispatchers.Main) {
-                        currentLocationSlot = slot
+                    val latestVisit = activeVisits.maxByOrNull { it.entryTime.time }
+                    val todayStart = Calendar.getInstance().apply {
+                        set(Calendar.HOUR_OF_DAY, 0)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.time
+
+                    if (latestVisit != null && !latestVisit.entryTime.before(todayStart)) {
+                        val slot = geofenceDao.getLocationSlotById(latestVisit.slotId)
+                        withContext(Dispatchers.Main) {
+                            currentLocationSlot = slot
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            currentLocationSlot = null
+                        }
                     }
                 } else {
                     withContext(Dispatchers.Main) {
@@ -1212,3 +1113,5 @@ class MainActivity : ComponentActivity() {
         return ActivityTransitionRequest(transitions)
     }
 }
+
+
